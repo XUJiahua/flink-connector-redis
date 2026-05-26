@@ -33,6 +33,7 @@ public class SQLQueryTest extends TestRedisConfigBase {
     @Test
     public void testQuery() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         singleRedisCommands.del("test");
         singleRedisCommands.set("test", "1");
@@ -61,6 +62,7 @@ public class SQLQueryTest extends TestRedisConfigBase {
     @Test
     public void testMapQuery() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         singleRedisCommands.del("test_hash");
         singleRedisCommands.hset("test_hash", "1", "1");
@@ -103,6 +105,7 @@ public class SQLQueryTest extends TestRedisConfigBase {
     @Test
     public void testSortedSetQuery() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         singleRedisCommands.del("test_sorted_set");
         singleRedisCommands.zadd("test_sorted_set", 1d, "test");
@@ -145,6 +148,7 @@ public class SQLQueryTest extends TestRedisConfigBase {
     @Test
     public void testLrangeQuery() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         singleRedisCommands.del("test_list");
         singleRedisCommands.lpush("test_list", "2", "test2");
@@ -174,6 +178,7 @@ public class SQLQueryTest extends TestRedisConfigBase {
     @Test
     public void testSrandmemberQuery() throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1);
         StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
         singleRedisCommands.del("test_set");
         singleRedisCommands.sadd("test_set", "2", "test2");

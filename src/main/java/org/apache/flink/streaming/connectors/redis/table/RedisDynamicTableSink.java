@@ -29,7 +29,7 @@ import org.apache.flink.streaming.connectors.redis.mapper.RowRedisSinkMapper;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
-import org.apache.flink.table.connector.sink.legacy.SinkFunctionProvider;
+import org.apache.flink.table.connector.sink.SinkV2Provider;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Preconditions;
 
@@ -75,14 +75,10 @@ public class RedisDynamicTableSink implements DynamicTableSink {
 
     @Override
     public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
-        RedisSinkFunction redisSinkFunction =
-                config.get(RedisOptions.SINK_LIMIT)
-                        ? new RedisLimitedSinkFunction(
-                                flinkConfigBase, redisMapper, resolvedSchema, config)
-                        : new RedisSinkFunction(
-                                flinkConfigBase, redisMapper, resolvedSchema, config);
-
-        return SinkFunctionProvider.of(redisSinkFunction, sinkParallelism);
+        boolean limited = config.get(RedisOptions.SINK_LIMIT);
+        RedisSink redisSink =
+                new RedisSink(flinkConfigBase, redisMapper, resolvedSchema, config, limited);
+        return SinkV2Provider.of(redisSink, sinkParallelism);
     }
 
     @Override

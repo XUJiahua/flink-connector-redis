@@ -19,7 +19,6 @@
 package org.apache.flink.streaming.connectors.redis.table;
 
 import org.apache.flink.configuration.ReadableConfig;
-import org.apache.flink.legacy.table.connector.source.SourceFunctionProvider;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommand;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigBase;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigHandler;
@@ -31,6 +30,7 @@ import org.apache.flink.streaming.connectors.redis.mapper.RowRedisQueryMapper;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.connector.source.InputFormatProvider;
 import org.apache.flink.table.connector.source.LookupTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.legacy.connector.source.AsyncTableFunctionProvider;
@@ -83,10 +83,9 @@ public class RedisDynamicTableSource implements ScanTableSource, LookupTableSour
 
     @Override
     public ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext) {
-        RedisSourceFunction redisSourceFunction =
-                new RedisSourceFunction<>(redisMapper, config, flinkConfigBase, resolvedSchema);
-        return SourceFunctionProvider.of(
-                redisSourceFunction, this.redisCommand.isCommandBoundedness());
+        RedisInputFormat inputFormat =
+                new RedisInputFormat(redisMapper, config, flinkConfigBase, resolvedSchema);
+        return InputFormatProvider.of(inputFormat);
     }
 
     @Override
