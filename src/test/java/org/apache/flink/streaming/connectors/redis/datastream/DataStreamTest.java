@@ -55,7 +55,7 @@ public class DataStreamTest extends TestRedisConfigBase {
         Configuration configuration = new Configuration();
         configuration.setString(REDIS_MODE, REDIS_SINGLE);
         configuration.setString(REDIS_COMMAND, RedisCommand.HSET.name());
-        configuration.setInteger(TTL, 10);
+        configuration.set(TTL, 10);
 
         RedisSinkMapper redisMapper = new RowRedisSinkMapper(RedisCommand.HSET, configuration);
 
