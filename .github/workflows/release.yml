@@ -53,7 +53,7 @@ jobs:
 
       - name: Configure Redis password
         run: |
-          redis-cli -h 127.0.0.1 -p 6379 CONFIG SET requirepass test123
+          docker exec ${{ job.services.redis.id }} redis-cli CONFIG SET requirepass test123
 
       - name: Build and test
         run: |
