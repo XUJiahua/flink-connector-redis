@@ -18,9 +18,10 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
-import org.apache.flink.configuration.Configuration;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.configuration.ReadableConfig;
-import org.apache.flink.streaming.api.functions.source.RichSourceFunction;
+import org.apache.flink.streaming.api.functions.source.legacy.RichSourceFunction;
+import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommand;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommandBaseDescription;
 import org.apache.flink.streaming.connectors.redis.command.RedisSelectCommand;
@@ -79,7 +80,7 @@ public class RedisSourceFunction<T> extends RichSourceFunction<T> {
     }
 
     @Override
-    public void open(Configuration parameters) throws Exception {
+    public void open(OpenContext openContext) throws Exception {
         validator();
         this.queryParameter = new String[2];
         this.queryParameter[0] = this.readableConfig.get(RedisOptions.SCAN_KEY);
@@ -98,11 +99,10 @@ public class RedisSourceFunction<T> extends RichSourceFunction<T> {
             LOG.error("Redis has not been properly initialized: ", e);
             throw e;
         }
-        super.open(parameters);
     }
 
     @Override
-    public void run(SourceContext ctx) throws Exception {
+    public void run(SourceFunction.SourceContext ctx) throws Exception {
         // It will try many times which less than {@code maxRetryTimes} until execute success.
         for (int i = 0; i <= maxRetryTimes; i++) {
             try {
@@ -118,7 +118,7 @@ public class RedisSourceFunction<T> extends RichSourceFunction<T> {
         }
     }
 
-    private void query(SourceContext ctx) throws Exception {
+    private void query(SourceFunction.SourceContext ctx) throws Exception {
         switch (redisCommand.getSelectCommand()) {
             case GET: {
                 String result = this.redisCommandsContainer.get(queryParameter[0]).get();

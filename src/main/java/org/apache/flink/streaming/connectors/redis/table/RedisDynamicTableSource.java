@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.connectors.redis.table;
 
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.legacy.table.connector.source.SourceFunctionProvider;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommand;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigBase;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigHandler;
@@ -29,11 +30,10 @@ import org.apache.flink.streaming.connectors.redis.mapper.RedisMapper;
 import org.apache.flink.streaming.connectors.redis.mapper.RowRedisQueryMapper;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.connector.ChangelogMode;
-import org.apache.flink.table.connector.source.AsyncTableFunctionProvider;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.connector.source.LookupTableSource;
 import org.apache.flink.table.connector.source.ScanTableSource;
-import org.apache.flink.table.connector.source.SourceFunctionProvider;
+import org.apache.flink.table.legacy.connector.source.AsyncTableFunctionProvider;
 import org.apache.flink.util.Preconditions;
 
 import java.util.Map;

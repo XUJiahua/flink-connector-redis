@@ -18,8 +18,9 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
-import org.apache.flink.calcite.shaded.com.google.common.cache.Cache;
-import org.apache.flink.calcite.shaded.com.google.common.cache.CacheBuilder;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommand;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommandBaseDescription;
@@ -298,7 +299,7 @@ public class RedisLookupFunction extends AsyncTableFunction<RowData> {
         this.cache =
                 cacheMaxSize == -1 || cacheTtl == -1
                         ? null
-                        : CacheBuilder.newBuilder()
+                        : Caffeine.newBuilder()
                                 .expireAfterWrite(cacheTtl, TimeUnit.SECONDS)
                                 .maximumSize(cacheMaxSize)
                                 .build();

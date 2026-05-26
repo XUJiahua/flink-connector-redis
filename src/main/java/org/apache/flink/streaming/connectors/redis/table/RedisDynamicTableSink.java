@@ -29,7 +29,7 @@ import org.apache.flink.streaming.connectors.redis.mapper.RowRedisSinkMapper;
 import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.connector.ChangelogMode;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
-import org.apache.flink.table.connector.sink.SinkFunctionProvider;
+import org.apache.flink.table.connector.sink.legacy.SinkFunctionProvider;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Preconditions;
 

@@ -18,8 +18,9 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
-import org.apache.flink.configuration.Configuration;
+import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.functions.sink.legacy.SinkFunction;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigBase;
 import org.apache.flink.streaming.connectors.redis.config.RedisOptions;
 import org.apache.flink.streaming.connectors.redis.mapper.RedisSinkMapper;
@@ -83,13 +84,13 @@ public class RedisLimitedSinkFunction<IN> extends RedisSinkFunction<IN> {
     }
 
     @Override
-    public void open(Configuration parameters) throws Exception {
-        super.open(parameters);
+    public void open(OpenContext openContext) throws Exception {
+        super.open(openContext);
         startTime = System.currentTimeMillis();
     }
 
     @Override
-    public void invoke(IN input, Context context) throws Exception {
+    public void invoke(IN input, SinkFunction.Context context) throws Exception {
         long remainTime = maxOnline - (System.currentTimeMillis() - startTime);
         if (remainTime < 0) {
             throw new RuntimeException(
