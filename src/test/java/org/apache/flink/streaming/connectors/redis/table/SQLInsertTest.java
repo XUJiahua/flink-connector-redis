@@ -248,7 +248,8 @@ public class SQLInsertTest extends TestRedisConfigBase {
         String sql = " insert into sink_redis select * from (values ('test_hash', '12', 10.1))";
         TableResult tableResult = tEnv.executeSql(sql);
         tableResult.getJobClient().get().getJobExecutionResult().get();
-        Preconditions.condition(singleRedisCommands.hget("test_hash", "12").equals("11.1"), "");
+        double actual = Double.parseDouble((String) singleRedisCommands.hget("test_hash", "12"));
+        Preconditions.condition(Math.abs(actual - 11.1) < 1e-6, "expected 11.1 but got " + actual);
     }
 
     @Test

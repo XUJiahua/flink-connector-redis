@@ -211,6 +211,30 @@ public class RedisOptions {
                     .defaultValue(false)
                     .withDescription("Optional turn on the audit log switch.");
 
+    public static final ConfigOption<Integer> SINK_BATCH_SIZE =
+            ConfigOptions.key("sink.batch.size")
+                    .intType()
+                    .defaultValue(100)
+                    .withDescription(
+                            "The number of records to buffer before flushing to Redis. "
+                                    + "Set to 1 to disable batching (fire-and-forget per record).");
+
+    public static final ConfigOption<Long> SINK_BATCH_FLUSH_INTERVAL =
+            ConfigOptions.key("sink.batch.flush-interval")
+                    .longType()
+                    .defaultValue(1000L)
+                    .withDescription(
+                            "The maximum time in milliseconds to buffer records before flushing, "
+                                    + "even if batch size has not been reached.");
+
+    public static final ConfigOption<Integer> SINK_MAX_IN_FLIGHT_REQUESTS =
+            ConfigOptions.key("sink.max-in-flight-requests")
+                    .intType()
+                    .defaultValue(1000)
+                    .withDescription(
+                            "The maximum number of async requests that can be in flight at the same time. "
+                                    + "This provides backpressure when Redis is slow.");
+
     private RedisOptions() {
     }
 }

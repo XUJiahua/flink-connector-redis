@@ -118,6 +118,9 @@ public class RedisDynamicTableFactory
         options.add(RedisOptions.SCAN_COUNT);
         options.add(RedisOptions.ZREM_RANGEBY);
         options.add(RedisOptions.AUDIT_LOG);
+        options.add(RedisOptions.SINK_BATCH_SIZE);
+        options.add(RedisOptions.SINK_BATCH_FLUSH_INTERVAL);
+        options.add(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS);
         return options;
     }
 
