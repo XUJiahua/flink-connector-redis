@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.connectors.redis.table;
 
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigBase;
 import org.apache.flink.streaming.connectors.redis.config.RedisOptions;
 import org.apache.flink.streaming.connectors.redis.mapper.RedisSinkMapper;
@@ -48,8 +49,9 @@ public class RedisLimitedSinkWriter extends RedisSinkWriter {
             FlinkConfigBase flinkConfigBase,
             RedisSinkMapper<RowData> redisSinkMapper,
             List<DataType> columnDataTypes,
-            ReadableConfig config) {
-        super(flinkConfigBase, redisSinkMapper, columnDataTypes, config);
+            ReadableConfig config,
+            SinkWriterMetricGroup metricGroup) {
+        super(flinkConfigBase, redisSinkMapper, columnDataTypes, config, metricGroup);
 
         this.maxOnline = config.get(RedisOptions.SINK_LIMIT_MAX_ONLINE);
         Preconditions.checkState(

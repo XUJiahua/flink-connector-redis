@@ -20,6 +20,8 @@ package org.apache.flink.streaming.connectors.redis.table;
 
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.metrics.Counter;
+import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommand;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommandDescription;
 import org.apache.flink.streaming.connectors.redis.command.RedisInsertCommand;
@@ -67,12 +69,16 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     protected Integer ttl;
     protected int expireTimeSeconds = -1;
     private transient RedisCommandsContainer redisCommandsContainer;
+    private transient Counter numRecordsSendCounter;
+    private transient Counter numRecordsSendErrorsCounter;
+    private transient Counter numBytesSendCounter;
 
     public RedisSinkWriter(
             FlinkConfigBase flinkConfigBase,
             RedisSinkMapper<RowData> redisSinkMapper,
             List<DataType> columnDataTypes,
-            ReadableConfig readableConfig) {
+            ReadableConfig readableConfig,
+            SinkWriterMetricGroup metricGroup) {
         Objects.requireNonNull(flinkConfigBase, "Redis connection pool config should not be null");
         Objects.requireNonNull(redisSinkMapper, "Redis Mapper can not be null");
 
@@ -96,6 +102,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         this.columnDataTypes = columnDataTypes;
         this.redisValueDataStructure = readableConfig.get(RedisOptions.VALUE_DATA_STRUCTURE);
         this.zremrangeby = readableConfig.get(RedisOptions.ZREM_RANGEBY);
+
+        // Initialize metrics
+        if (metricGroup != null) {
+            this.numRecordsSendCounter = metricGroup.getNumRecordsSendCounter();
+            this.numRecordsSendErrorsCounter = metricGroup.getNumRecordsSendErrorsCounter();
+            this.numBytesSendCounter = metricGroup.getNumBytesSendCounter();
+        }
 
         // Initialize Redis connection
         Preconditions.checkArgument(
@@ -133,7 +146,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
         try {
             startSink(params, kind);
+            if (numRecordsSendCounter != null) {
+                numRecordsSendCounter.inc();
+            }
         } catch (Exception e) {
+            if (numRecordsSendErrorsCounter != null) {
+                numRecordsSendErrorsCounter.inc();
+            }
             throw new IOException("Failed to write to Redis", e);
         }
         if (auditLog) {

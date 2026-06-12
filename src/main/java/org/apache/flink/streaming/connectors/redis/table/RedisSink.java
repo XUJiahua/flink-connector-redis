@@ -59,8 +59,11 @@ public class RedisSink implements Sink<RowData> {
     public SinkWriter<RowData> createWriter(WriterInitContext context) throws IOException {
         if (limited) {
             return new RedisLimitedSinkWriter(
-                    flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig);
+                    flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
+                    context.metricGroup());
         }
-        return new RedisSinkWriter(flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig);
+        return new RedisSinkWriter(
+                flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
+                context.metricGroup());
     }
 }
