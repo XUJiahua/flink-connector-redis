@@ -8,10 +8,11 @@
 3.增加关联查询缓存(支持增量与全量)
 4.增加支持整行保存功能，用于多字段的维表关联查询
 5.增加限流功能，用于Flink SQL在线调试功能
-6.增加支持Flink高版本（包括1.12,1.13,1.14+）
+6.支持Flink 2.x（使用Sink V2 API）
 7.统一过期策略等
 8.支持flink cdc删除及其它RowKind.DELETE
 9.支持select查询
+10.支持mini-batch批量写入与异步背压控制
 ```
 
 因bahir使用的flink接口版本较老，所以改动较大，开发过程中参考了腾讯云与阿里云两家产商的流计算产品，取两家之长，并增加了更丰富的功能。
@@ -22,8 +23,8 @@
 
 # 2 使用方法: 
 ## 2.1 工程直接引用
-项目依赖Lettuce(6.2.1)及netty-transport-native-epoll(4.1.82.Final),如flink环境有这两个包,则使用flink-connector-redis-1.4.3.jar，
-否则使用flink-connector-redis-1.4.3-jar-with-dependencies.jar。
+项目依赖Lettuce(6.2.1)及netty-transport-native-epoll(4.1.82.Final),如flink环境有这两个包,则使用flink-connector-redis-2.2.2.jar，
+否则使用flink-connector-redis-2.2.2-jar-with-dependencies.jar。
 <br/>
 ```
 <dependency>
@@ -31,7 +32,7 @@
     <artifactId>flink-connector-redis</artifactId>
     <!-- 没有单独引入项目依赖Lettuce netty-transport-native-epoll依赖时 -->
     <!--            <classifier>jar-with-dependencies</classifier>-->
-    <version>1.4.3</version>
+    <version>2.2.2</version>
 </dependency>
 ```
 ## 2.2 自行打包
@@ -143,7 +144,15 @@ create table sink_redis(name VARCHAR, subject VARCHAR, score VARCHAR)  with ('co
 | ttl.key.not.absent | false   | boolean | 与ttl一起使用,当key不存在时才设置ttl                                           |
 
 
-## 3.3 在线调试SQL时，用于限制sink资源使用的参数:
+## 3.3 sink批量写入与背压参数:
+
+| Field                      | Default | Type    | Description                                              |
+|----------------------------|---------|---------|----------------------------------------------------------|
+| sink.batch.size            | 100     | Integer | 缓冲多少条记录后批量写入Redis，设为1则禁用批量（逐条写入）                        |
+| sink.batch.flush-interval  | 1000    | Long    | 最大缓冲时间(毫秒)，即使未达到batch.size也会触发写入                          |
+| sink.max-in-flight-requests| 1000    | Integer | 最大异步在途请求数，用于背压控制，Redis响应慢时自动限速                            |
+
+## 3.4 在线调试SQL时，用于限制sink资源使用的参数:
 
 | Field                 | Default | Type    | Description                             |
 |-----------------------|---------|---------|-----------------------------------------|
@@ -153,7 +162,7 @@ create table sink_redis(name VARCHAR, subject VARCHAR, score VARCHAR)  with ('co
 | sink.limit.max-online | 30 * 60 * 1000L   | Long    | taskmanager内每个slot最大在线时间, milliseconds  |
 
 
-## 3.4 集群类型为sentinel时额外连接参数:
+## 3.5 集群类型为sentinel时额外连接参数:
 
 | 字段                 | 默认值 | 类型   | 说明                                                      |
 |--------------------| ------ | ------ |---------------------------------------------------------|
@@ -335,15 +344,26 @@ ide: IntelliJ IDEA
 
 code format: google-java-format + Save Actions
 
-flink 1.12/1.13/1.14+
+flink 2.2.x
 
-jdk1.8 Lettuce 6.2.1
+jdk11+ Lettuce 6.2.1
 
 # 8 贡献
 Pull Request需要提交至dev分支</br>
 提交前请使用mvn spotless:apply进行代码格式化,然后使用maven package打包确认所有测试用例能通过。
 
-# 9 flink 1.12支持
+# 9 历史版本
+## Flink 1.x 支持
+Flink 1.14/1.15 请使用 1.4.3 版本:
+```
+<dependency>
+    <groupId>io.github.jeff-zou</groupId>
+    <artifactId>flink-connector-redis</artifactId>
+    <version>1.4.3</version>
+</dependency>
+```
+
+## Flink 1.12 支持
 请切换到分支flink-1.12(注：1.12使用jedis)
 ```
 <dependency>
