@@ -44,6 +44,7 @@ import io.lettuce.core.Range;
 import io.lettuce.core.RedisFuture;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -256,6 +257,15 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 sendRecord(record);
                 if (numRecordsSendCounter != null) {
                     numRecordsSendCounter.inc();
+                }
+                if (numBytesSendCounter != null) {
+                    long bytes = 0;
+                    for (String param : record.params) {
+                        if (param != null) {
+                            bytes += param.getBytes(StandardCharsets.UTF_8).length;
+                        }
+                    }
+                    numBytesSendCounter.inc(bytes);
                 }
             } catch (Exception e) {
                 inFlightSemaphore.release();
