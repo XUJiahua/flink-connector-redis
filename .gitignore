@@ -28,4 +28,4 @@ keytmp/
 run/
 dist-deploy/
 coverage/
-run_backup/
+run_backup/dump.rdb

@@ -75,7 +75,7 @@ public class SQLExpireTest extends TestRedisConfigBase {
         String dim =
                 "create table sink_redis(name varchar, level varchar, age varchar) with ( "
                         + singleWith()
-                        + " 'ttl'='8', 'ttl.key.not.absent'='true', '"
+                        + " 'ttl'='8', 'ttl.key.not.absent'='true', 'sink.batch.size'='1', '"
                         + REDIS_COMMAND
                         + "'='"
                         + RedisCommand.HSET
