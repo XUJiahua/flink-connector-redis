@@ -122,8 +122,9 @@ public class RedisOptions {
     public static final ConfigOption<Integer> SINK_PARALLELISM =
             ConfigOptions.key("sink.parallelism")
                     .intType()
-                    .defaultValue(1)
-                    .withDescription("Optional parrallelism for sink");
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional parallelism for sink. If not set, follows the job default parallelism.");
     public static final ConfigOption<Boolean> SINK_LIMIT =
             ConfigOptions.key("sink.limit")
                     .booleanType()
