@@ -228,6 +228,26 @@ public class RedisOptions {
                             "The maximum time in milliseconds to buffer records before flushing, "
                                     + "even if batch size has not been reached.");
 
+    public static final ConfigOption<Long> SINK_WRITE_QPS =
+            ConfigOptions.key("sink.write.qps")
+                    .longType()
+                    .defaultValue(0L)
+                    .withDescription(
+                            "The maximum total write QPS (Redis commands per second) for the whole "
+                                    + "sink across all parallel subtasks. The limit is split evenly "
+                                    + "across subtasks at runtime (per-subtask qps = total / parallelism). "
+                                    + "A value <= 0 means unlimited (no throttling).");
+
+    public static final ConfigOption<Double> SINK_WRITE_QPS_BURST_SECONDS =
+            ConfigOptions.key("sink.write.qps.burst-seconds")
+                    .doubleType()
+                    .defaultValue(1.0)
+                    .withDescription(
+                            "How many seconds worth of permits the QPS rate limiter may accumulate "
+                                    + "as burst capacity. Larger values tolerate bigger mini-batch "
+                                    + "bursts; smaller values enforce a smoother rate. Only effective "
+                                    + "when sink.write.qps > 0.");
+
     public static final ConfigOption<Integer> SINK_MAX_IN_FLIGHT_REQUESTS =
             ConfigOptions.key("sink.max-in-flight-requests")
                     .intType()

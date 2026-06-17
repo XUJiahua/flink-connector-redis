@@ -121,6 +121,8 @@ public class RedisDynamicTableFactory
         options.add(RedisOptions.SINK_BATCH_SIZE);
         options.add(RedisOptions.SINK_BATCH_FLUSH_INTERVAL);
         options.add(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS);
+        options.add(RedisOptions.SINK_WRITE_QPS);
+        options.add(RedisOptions.SINK_WRITE_QPS_BURST_SECONDS);
         return options;
     }
 

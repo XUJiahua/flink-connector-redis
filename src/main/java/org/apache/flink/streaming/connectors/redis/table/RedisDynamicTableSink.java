@@ -78,6 +78,12 @@ public class RedisDynamicTableSink implements DynamicTableSink {
         boolean limited = config.get(RedisOptions.SINK_LIMIT);
         RedisSink redisSink =
                 new RedisSink(flinkConfigBase, redisMapper, resolvedSchema, config, limited);
+        if (limited) {
+            // The limited sink is an online-debugging tool whose limits (max-num / max-online)
+            // are tracked per writer instance. It must run single-threaded so that the limits are
+            // global and deterministic regardless of the job's default parallelism.
+            return SinkV2Provider.of(redisSink, 1);
+        }
         return SinkV2Provider.of(redisSink, sinkParallelism);
     }
 

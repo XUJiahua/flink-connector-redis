@@ -57,13 +57,14 @@ public class RedisSink implements Sink<RowData> {
 
     @Override
     public SinkWriter<RowData> createWriter(WriterInitContext context) throws IOException {
+        int numParallelSubtasks = context.getTaskInfo().getNumberOfParallelSubtasks();
         if (limited) {
             return new RedisLimitedSinkWriter(
                     flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
-                    context.metricGroup());
+                    context.metricGroup(), numParallelSubtasks);
         }
         return new RedisSinkWriter(
                 flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
-                context.metricGroup());
+                context.metricGroup(), numParallelSubtasks);
     }
 }

@@ -50,8 +50,10 @@ public class RedisLimitedSinkWriter extends RedisSinkWriter {
             RedisSinkMapper<RowData> redisSinkMapper,
             List<DataType> columnDataTypes,
             ReadableConfig config,
-            SinkWriterMetricGroup metricGroup) {
-        super(flinkConfigBase, redisSinkMapper, columnDataTypes, config, metricGroup);
+            SinkWriterMetricGroup metricGroup,
+            int numParallelSubtasks) {
+        super(flinkConfigBase, redisSinkMapper, columnDataTypes, config, metricGroup,
+                numParallelSubtasks);
 
         this.maxOnline = config.get(RedisOptions.SINK_LIMIT_MAX_ONLINE);
         Preconditions.checkState(
@@ -92,6 +94,9 @@ public class RedisLimitedSinkWriter extends RedisSinkWriter {
         // all keys must expire 10 seconds after online debugging end.
         super.ttl = (int) remainTime / 1000 + 10;
         super.write(rowData, context);
+        // Online debugging writes each record immediately so that results are visible right away
+        // and are not lost in the mini-batch buffer when the job stops on a limit.
+        flushBuffer();
 
         TimeUnit.MILLISECONDS.sleep(sinkInterval);
         curNum++;

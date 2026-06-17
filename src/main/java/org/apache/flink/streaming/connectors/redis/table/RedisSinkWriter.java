@@ -33,6 +33,7 @@ import org.apache.flink.streaming.connectors.redis.container.RedisCommandsContai
 import org.apache.flink.streaming.connectors.redis.container.RedisCommandsContainerBuilder;
 import org.apache.flink.streaming.connectors.redis.converter.RedisRowConverter;
 import org.apache.flink.streaming.connectors.redis.mapper.RedisSinkMapper;
+import org.apache.flink.streaming.connectors.redis.util.TokenBucketRateLimiter;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
 import org.apache.flink.types.RowKind;
@@ -88,6 +89,12 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final int maxInFlightRequests;
     private transient Semaphore inFlightSemaphore;
 
+    // --- Write QPS rate limiting ---
+    private final long writeQps;
+    private final double writeQpsBurstSeconds;
+    private final int numParallelSubtasks;
+    private transient TokenBucketRateLimiter rateLimiter;
+
     // --- Async error tracking ---
     private transient AtomicReference<Throwable> asyncError;
 
@@ -111,7 +118,8 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             RedisSinkMapper<RowData> redisSinkMapper,
             List<DataType> columnDataTypes,
             ReadableConfig readableConfig,
-            SinkWriterMetricGroup metricGroup) {
+            SinkWriterMetricGroup metricGroup,
+            int numParallelSubtasks) {
         Objects.requireNonNull(flinkConfigBase, "Redis connection pool config should not be null");
         Objects.requireNonNull(redisSinkMapper, "Redis Mapper can not be null");
 
@@ -141,6 +149,11 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         this.batchFlushIntervalMs = readableConfig.get(RedisOptions.SINK_BATCH_FLUSH_INTERVAL);
         this.maxInFlightRequests = readableConfig.get(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS);
 
+        // Write QPS rate-limiting configuration (total across all subtasks)
+        this.writeQps = readableConfig.get(RedisOptions.SINK_WRITE_QPS);
+        this.writeQpsBurstSeconds = readableConfig.get(RedisOptions.SINK_WRITE_QPS_BURST_SECONDS);
+        this.numParallelSubtasks = Math.max(1, numParallelSubtasks);
+
         // Initialize metrics
         if (metricGroup != null) {
             this.numRecordsSendCounter = metricGroup.getNumRecordsSendCounter();
@@ -169,6 +182,20 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         this.inFlightSemaphore = new Semaphore(maxInFlightRequests);
         this.asyncError = new AtomicReference<>(null);
         this.inFlightFutures = new ArrayList<>();
+
+        // Initialize write-QPS rate limiter. The configured QPS is the total budget for the whole
+        // sink, so each subtask gets an equal share.
+        if (writeQps > 0) {
+            double perSubtaskQps = (double) writeQps / this.numParallelSubtasks;
+            this.rateLimiter = new TokenBucketRateLimiter(perSubtaskQps, writeQpsBurstSeconds);
+            LOG.info(
+                    "Redis sink write QPS limiting enabled: total={}, subtasks={}, perSubtaskQps={}",
+                    writeQps,
+                    this.numParallelSubtasks,
+                    perSubtaskQps);
+        } else {
+            this.rateLimiter = null;
+        }
     }
 
     @Override
@@ -236,12 +263,17 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
      * Flushes all buffered records to Redis. Each record is sent as an async command
      * with backpressure controlled by the semaphore.
      */
-    private void flushBuffer() throws IOException, InterruptedException {
+    protected void flushBuffer() throws IOException, InterruptedException {
         if (batchBuffer.isEmpty()) {
             return;
         }
 
         for (PendingRecord record : batchBuffer) {
+            // Rate limiting: throttle the rate at which commands are issued to Redis (write QPS).
+            if (rateLimiter != null) {
+                rateLimiter.acquire();
+            }
+
             // Backpressure: acquire permit (blocks if too many in-flight)
             if (!inFlightSemaphore.tryAcquire(60, TimeUnit.SECONDS)) {
                 throw new IOException(
