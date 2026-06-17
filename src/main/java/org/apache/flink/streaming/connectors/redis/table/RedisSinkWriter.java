@@ -18,6 +18,7 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
+import org.apache.flink.api.common.operators.MailboxExecutor;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.metrics.Counter;
@@ -55,6 +56,7 @@ import java.util.Objects;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 /** Sink writer for Redis using Sink V2 API with mini-batch buffering and backpressure. */
 public class RedisSinkWriter implements SinkWriter<RowData> {
@@ -95,6 +97,12 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final int numParallelSubtasks;
     private transient TokenBucketRateLimiter rateLimiter;
 
+    // --- Cooperative waiting (do not freeze the Flink task/mailbox thread) ---
+    private final transient MailboxExecutor mailboxExecutor;
+    private static final long MAX_PARK_NANOS = 1_000_000L; // 1ms slices while waiting
+    private static final long IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS = 60_000_000_000L; // 60s
+    private transient boolean flushing;
+
     // --- Async error tracking ---
     private transient AtomicReference<Throwable> asyncError;
 
@@ -119,11 +127,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             List<DataType> columnDataTypes,
             ReadableConfig readableConfig,
             SinkWriterMetricGroup metricGroup,
-            int numParallelSubtasks) {
+            int numParallelSubtasks,
+            MailboxExecutor mailboxExecutor) {
         Objects.requireNonNull(flinkConfigBase, "Redis connection pool config should not be null");
         Objects.requireNonNull(redisSinkMapper, "Redis Mapper can not be null");
 
         this.flinkConfigBase = flinkConfigBase;
+        this.mailboxExecutor = mailboxExecutor;
         this.maxRetryTimes = readableConfig.get(RedisOptions.MAX_RETRIES);
         this.redisSinkMapper = redisSinkMapper;
         RedisCommandDescription redisCommandDescription =
@@ -264,52 +274,114 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
      * with backpressure controlled by the semaphore.
      */
     protected void flushBuffer() throws IOException, InterruptedException {
-        if (batchBuffer.isEmpty()) {
+        if (batchBuffer.isEmpty() || flushing) {
             return;
         }
+        // Guard against re-entrancy: yielding to the mailbox below may run mail that triggers
+        // another flush; we must not iterate/clear the buffer concurrently.
+        flushing = true;
+        try {
+            for (PendingRecord record : batchBuffer) {
+                // Rate limiting: throttle the rate at which commands are issued to Redis (write
+                // QPS). Wait cooperatively so the task/mailbox thread stays responsive to
+                // checkpoint barriers instead of being frozen in Thread.sleep.
+                if (rateLimiter != null) {
+                    cooperativeWait(rateLimiter.reserve(1));
+                }
 
-        for (PendingRecord record : batchBuffer) {
-            // Rate limiting: throttle the rate at which commands are issued to Redis (write QPS).
-            if (rateLimiter != null) {
-                rateLimiter.acquire();
+                // Backpressure: acquire a permit, again yielding to the mailbox while waiting so a
+                // slow Redis does not freeze the task thread for the whole timeout.
+                acquireInFlightPermit();
+
+                // Check for async errors before sending more
+                checkAsyncError();
+
+                try {
+                    sendRecord(record);
+                    if (numRecordsSendCounter != null) {
+                        numRecordsSendCounter.inc();
+                    }
+                    if (numBytesSendCounter != null) {
+                        long bytes = 0;
+                        for (String param : record.params) {
+                            if (param != null) {
+                                bytes += param.getBytes(StandardCharsets.UTF_8).length;
+                            }
+                        }
+                        numBytesSendCounter.inc(bytes);
+                    }
+                } catch (Exception e) {
+                    inFlightSemaphore.release();
+                    if (numRecordsSendErrorsCounter != null) {
+                        numRecordsSendErrorsCounter.inc();
+                    }
+                    throw new IOException("Failed to write to Redis", e);
+                }
             }
 
-            // Backpressure: acquire permit (blocks if too many in-flight)
-            if (!inFlightSemaphore.tryAcquire(60, TimeUnit.SECONDS)) {
+            batchBuffer.clear();
+            lastFlushTimeMs = System.currentTimeMillis();
+        } finally {
+            flushing = false;
+        }
+    }
+
+    /**
+     * Cooperatively waits for the given number of nanoseconds, yielding to the Flink mailbox so
+     * that checkpoint-related mail and async completion callbacks keep being processed instead of
+     * freezing the task thread inside {@code Thread.sleep}.
+     */
+    private void cooperativeWait(long waitNanos) throws InterruptedException {
+        if (waitNanos <= 0) {
+            return;
+        }
+        long deadline = System.nanoTime() + waitNanos;
+        long remaining;
+        while ((remaining = deadline - System.nanoTime()) > 0) {
+            if (!tryYieldMailbox()) {
+                LockSupport.parkNanos(Math.min(remaining, MAX_PARK_NANOS));
+            }
+        }
+    }
+
+    /**
+     * Acquires a backpressure permit, yielding to the mailbox while waiting so a slow Redis does
+     * not freeze the task thread. Times out after {@link #IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS}.
+     */
+    private void acquireInFlightPermit() throws IOException, InterruptedException {
+        if (inFlightSemaphore.tryAcquire()) {
+            return;
+        }
+        long deadline = System.nanoTime() + IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS;
+        while (!inFlightSemaphore.tryAcquire()) {
+            if (System.nanoTime() > deadline) {
                 throw new IOException(
                         "Timeout waiting for available slot to send Redis command. "
                                 + "Redis may be overloaded. Consider increasing sink.max-in-flight-requests "
                                 + "or reducing throughput.");
             }
-
-            // Check for async errors before sending more
+            // Surface async failures promptly while waiting.
             checkAsyncError();
-
-            try {
-                sendRecord(record);
-                if (numRecordsSendCounter != null) {
-                    numRecordsSendCounter.inc();
-                }
-                if (numBytesSendCounter != null) {
-                    long bytes = 0;
-                    for (String param : record.params) {
-                        if (param != null) {
-                            bytes += param.getBytes(StandardCharsets.UTF_8).length;
-                        }
-                    }
-                    numBytesSendCounter.inc(bytes);
-                }
-            } catch (Exception e) {
-                inFlightSemaphore.release();
-                if (numRecordsSendErrorsCounter != null) {
-                    numRecordsSendErrorsCounter.inc();
-                }
-                throw new IOException("Failed to write to Redis", e);
+            if (!tryYieldMailbox()) {
+                LockSupport.parkNanos(MAX_PARK_NANOS);
             }
         }
+    }
 
-        batchBuffer.clear();
-        lastFlushTimeMs = System.currentTimeMillis();
+    /**
+     * Runs a single piece of mailbox mail if any is pending. Returns {@code true} if mail was
+     * executed. Safe no-op when no mailbox executor is available (e.g. in unit tests).
+     */
+    private boolean tryYieldMailbox() {
+        if (mailboxExecutor == null) {
+            return false;
+        }
+        try {
+            return mailboxExecutor.tryYield();
+        } catch (Throwable t) {
+            // Mailbox may be closing; fall back to plain waiting.
+            return false;
+        }
     }
 
     /**

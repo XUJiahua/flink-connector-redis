@@ -154,6 +154,26 @@ create table sink_redis(name VARCHAR, subject VARCHAR, score VARCHAR)  with ('co
 | sink.write.qps             | 0       | Long    | 整个sink（所有并行子任务合计）的最大写入QPS（每秒发往Redis的命令数）。运行时按并行度均分到各子任务（每子任务QPS=总QPS/并行度）。<=0 表示不限速 |
 | sink.write.qps.burst-seconds| 1.0    | Double  | 令牌桶允许累积的突发容量(秒)。值越大越能容忍批量突发，值越小限速越平滑。仅当 sink.write.qps>0 时生效 |
 
+### 3.3.1 写 QPS 限速与 checkpoint 配合（重要）
+
+`sink.write.qps` 用令牌桶限制每秒发往 Redis 的命令数，用于在高峰期保护 Redis（例如把写 QPS 从 20w 压到 5w）。使用时请注意以下几点：
+
+1. **限速是全局预算、按并行度均分。** 配 `sink.write.qps=50000`、sink 并行度为 10 时，每个子任务限到 5000 QPS。修改 sink 并行度会改变单子任务速率，但总量不变。
+
+2. **限速会产生反压，这是预期行为。** 被限速的 sink 是作业的人为瓶颈，Flink UI 中该 sink 的 `busy` 会接近 100%，上游（含 Source）会被反压而呈现"读一批—停—再读一批"的脉冲式消费。这说明限速生效了，不是故障。
+
+3. **等待令牌时不会冻结 task 线程。** 限速器与背压（`sink.max-in-flight-requests`）的等待都改成了协作式：等待期间会让出 Flink 的 mailbox 线程去处理其他邮件，并以毫秒级切片轮询，因此不会像 `Thread.sleep` 那样把主线程整段占死。
+
+4. **务必开启非对齐 checkpoint。** 限速带来的反压会让 checkpoint barrier 被网络缓冲区里堆积的数据挡住，导致对齐式 checkpoint 长时间无法完成。开启非对齐 checkpoint 可让 barrier 越过堆积数据：
+
+   ```
+   execution.checkpointing.unaligned.enabled: true
+   execution.checkpointing.aligned-checkpoint-timeout: 10s
+   ```
+
+   配合后，在限速产生持续反压的情况下 checkpoint 仍可稳定完成。
+
+
 ## 3.4 在线调试SQL时，用于限制sink资源使用的参数:
 
 | Field                 | Default | Type    | Description                             |

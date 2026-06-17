@@ -29,3 +29,4 @@ run/
 dist-deploy/
 coverage/
 run_backup/dump.rdb
+dump.rdb

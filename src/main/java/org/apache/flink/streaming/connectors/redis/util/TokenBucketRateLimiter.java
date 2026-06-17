@@ -83,7 +83,14 @@ public class TokenBucketRateLimiter implements Serializable {
         }
     }
 
-    private synchronized long reserve(int permits) {
+    /**
+     * Reserves {@code permits} permits and returns the number of nanoseconds the caller must wait
+     * before the permits become available, <b>without sleeping</b>. This lets the caller perform a
+     * cooperative wait (e.g. yielding to a Flink mailbox) instead of blocking a thread.
+     *
+     * @return nanoseconds to wait (0 if permits are immediately available)
+     */
+    public synchronized long reserve(int permits) {
         if (permits <= 0) {
             return 0L;
         }

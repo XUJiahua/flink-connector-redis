@@ -18,6 +18,7 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
+import org.apache.flink.api.common.operators.MailboxExecutor;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigBase;
@@ -51,9 +52,10 @@ public class RedisLimitedSinkWriter extends RedisSinkWriter {
             List<DataType> columnDataTypes,
             ReadableConfig config,
             SinkWriterMetricGroup metricGroup,
-            int numParallelSubtasks) {
+            int numParallelSubtasks,
+            MailboxExecutor mailboxExecutor) {
         super(flinkConfigBase, redisSinkMapper, columnDataTypes, config, metricGroup,
-                numParallelSubtasks);
+                numParallelSubtasks, mailboxExecutor);
 
         this.maxOnline = config.get(RedisOptions.SINK_LIMIT_MAX_ONLINE);
         Preconditions.checkState(
