@@ -43,6 +43,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.lettuce.core.Range;
+import io.lettuce.core.RedisCommandTimeoutException;
+import io.lettuce.core.RedisConnectionException;
 import io.lettuce.core.RedisFuture;
 
 import java.io.IOException;
@@ -51,10 +53,14 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -80,7 +86,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final boolean auditLog;
     protected Integer ttl;
     protected int expireTimeSeconds = -1;
-    private transient RedisCommandsContainer redisCommandsContainer;
+    private transient volatile RedisCommandsContainer redisCommandsContainer;
     private transient Counter numRecordsSendCounter;
     private transient Counter numRecordsSendErrorsCounter;
     private transient Counter numBytesSendCounter;
@@ -110,10 +116,16 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final transient MailboxExecutor mailboxExecutor;
     private static final long MAX_PARK_NANOS = 1_000_000L; // 1ms slices while waiting
     private static final long IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS = 60_000_000_000L; // 60s
+    private static final long RETRY_BACKOFF_BASE_MS = 100L;
+    private static final long RETRY_BACKOFF_MAX_MS = 2_000L;
     private transient boolean flushing;
 
     // --- Async error tracking ---
     private transient AtomicReference<Throwable> asyncError;
+
+    // --- Redis connection recovery ---
+    private transient Object redisCommandsContainerLock;
+    private transient ScheduledExecutorService retryExecutor;
 
     // --- In-flight per-record completion promises for flush ---
     // One promise per logical record write. It completes (normally) only once the whole write
@@ -191,11 +203,24 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 "the command %s do not support insert.",
                 redisCommand.name());
 
+        this.redisCommandsContainerLock = new Object();
+        this.retryExecutor =
+                Executors.newSingleThreadScheduledExecutor(
+                        runnable -> {
+                            Thread thread =
+                                    new Thread(
+                                            runnable,
+                                            "redis-sink-retry-"
+                                                    + System.identityHashCode(this));
+                            thread.setDaemon(true);
+                            return thread;
+                        });
+
         try {
-            this.redisCommandsContainer = RedisCommandsContainerBuilder.build(this.flinkConfigBase);
-            this.redisCommandsContainer.open();
+            this.redisCommandsContainer = createRedisCommandsContainer();
             LOG.info("success to create redis container for sink");
         } catch (Exception e) {
+            this.retryExecutor.shutdownNow();
             LOG.error("Redis has not been properly initialized: ", e);
             throw new RuntimeException(e);
         }
@@ -234,6 +259,12 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         } else {
             this.rateLimiter = null;
         }
+    }
+
+    private RedisCommandsContainer createRedisCommandsContainer() throws Exception {
+        RedisCommandsContainer container = RedisCommandsContainerBuilder.build(this.flinkConfigBase);
+        container.open();
+        return container;
     }
 
     @Override
@@ -292,6 +323,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             waitForInFlightCompletions();
         } catch (Exception e) {
             LOG.warn("Error during final flush on close", e);
+        }
+        if (retryExecutor != null) {
+            retryExecutor.shutdownNow();
         }
         if (redisCommandsContainer != null) {
             redisCommandsContainer.close();
@@ -469,20 +503,28 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private void attempt(
             PendingRecord record, int attemptsRemaining, CompletableFuture<Void> completion) {
         CompletionStage<?> writeStage;
+        RedisCommandsContainer commandContainer = this.redisCommandsContainer;
         try {
             writeStage =
                     record.kind == RowKind.DELETE
-                            ? rowKindDelete(record.params)
-                            : sink(record.params);
+                            ? rowKindDelete(commandContainer, record.params)
+                            : sink(commandContainer, record.params);
         } catch (Exception e) {
             // Synchronous failure issuing the command (e.g. connection already closed, or a
             // non-retryable UnsupportedOperationException from an unsupported command).
             if (attemptsRemaining > 0 && !(e instanceof UnsupportedOperationException)) {
-                LOG.warn(
-                        "sink redis error when issuing command, remaining retries:{}",
+                logRetryableFailure(
+                        "sink redis error when issuing command",
+                        keyOf(record),
                         attemptsRemaining,
                         e);
-                attempt(record, attemptsRemaining - 1, completion);
+                scheduleRetry(
+                        keyOf(record),
+                        commandContainer,
+                        e,
+                        attemptsRemaining,
+                        () -> attempt(record, attemptsRemaining - 1, completion),
+                        completion);
             } else {
                 recordAsyncFailure(keyOf(record), e);
                 completion.complete(null);
@@ -510,17 +552,18 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                     if (attemptsRemaining > 0) {
                         // Transient async failure: re-issue the whole write. The permit stays held
                         // (the promise remains pending) until the retry chain resolves.
-                        LOG.warn(
-                                "Async Redis write failed for key: {}, retrying (remaining={})",
+                        logRetryableFailure(
+                                "Async Redis write failed",
                                 keyOf(record),
                                 attemptsRemaining,
                                 (Throwable) t);
-                        try {
-                            attempt(record, attemptsRemaining - 1, completion);
-                        } catch (Throwable e) {
-                            recordAsyncFailure(keyOf(record), e);
-                            completion.complete(null);
-                        }
+                        scheduleRetry(
+                                keyOf(record),
+                                commandContainer,
+                                (Throwable) t,
+                                attemptsRemaining,
+                                () -> attempt(record, attemptsRemaining - 1, completion),
+                                completion);
                     } else {
                         // Retries exhausted: record the error (surfaced by checkAsyncError) and
                         // resolve the promise.
@@ -528,6 +571,109 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                         completion.complete(null);
                     }
                 });
+    }
+
+    private void scheduleRetry(
+            String key,
+            RedisCommandsContainer failedContainer,
+            Throwable failure,
+            int attemptsRemaining,
+            Runnable retryAction,
+            CompletableFuture<Void> completion) {
+        long backoffMs = retryBackoffMs(attemptsRemaining);
+        try {
+            retryExecutor.schedule(
+                    () -> {
+                        try {
+                            if (shouldRecreateConnection(failure)) {
+                                reconnectRedisCommandsContainerIfCurrent(
+                                        failedContainer, key, failure);
+                            }
+                            retryAction.run();
+                        } catch (Throwable e) {
+                            recordAsyncFailure(key, e);
+                            completion.complete(null);
+                        }
+                    },
+                    backoffMs,
+                    TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            recordAsyncFailure(key, e);
+            completion.complete(null);
+        }
+    }
+
+    private long retryBackoffMs(int attemptsRemaining) {
+        int retryIndex = Math.max(0, maxRetryTimes - attemptsRemaining);
+        long backoffMs = RETRY_BACKOFF_BASE_MS << Math.min(retryIndex, 10);
+        return Math.min(RETRY_BACKOFF_MAX_MS, backoffMs);
+    }
+
+    private void reconnectRedisCommandsContainerIfCurrent(
+            RedisCommandsContainer failedContainer, String key, Throwable failure)
+            throws Exception {
+        synchronized (redisCommandsContainerLock) {
+            if (this.redisCommandsContainer != failedContainer) {
+                return;
+            }
+
+            LOG.warn(
+                    "Rebuilding Redis connection before retrying key: {} after failure: {}",
+                    key,
+                    failure.toString());
+            RedisCommandsContainer replacement = createRedisCommandsContainer();
+            this.redisCommandsContainer = replacement;
+            closeQuietly(failedContainer);
+        }
+    }
+
+    private void closeQuietly(RedisCommandsContainer container) {
+        if (container == null) {
+            return;
+        }
+        try {
+            container.close();
+        } catch (Exception e) {
+            LOG.warn("Error closing stale Redis connection", e);
+        }
+    }
+
+    private boolean shouldRecreateConnection(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof RedisConnectionException
+                    || current instanceof RedisCommandTimeoutException) {
+                return true;
+            }
+
+            String message = current.getMessage();
+            if (message != null) {
+                String lowerCaseMessage = message.toLowerCase(Locale.ROOT);
+                if (lowerCaseMessage.contains("connection closed")
+                        || lowerCaseMessage.contains("connection reset")
+                        || lowerCaseMessage.contains("connection refused")
+                        || lowerCaseMessage.contains("connection timed out")
+                        || lowerCaseMessage.contains("unable to connect")) {
+                    return true;
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private void logRetryableFailure(
+            String message, String key, int attemptsRemaining, Throwable failure) {
+        if (shouldRecreateConnection(failure)) {
+            LOG.warn(
+                    "{} for key: {}, retrying (remaining={}): {}",
+                    message,
+                    key,
+                    attemptsRemaining,
+                    failure.toString());
+        } else {
+            LOG.warn("{} for key: {}, retrying (remaining={})", message, key, attemptsRemaining, failure);
+        }
     }
 
     private static String keyOf(PendingRecord record) {
@@ -546,12 +692,19 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             PendingRecord record, int attemptsRemaining, CompletableFuture<Void> completion) {
         final String key = keyOf(record);
         CompletionStage<?> ttlStage;
+        RedisCommandsContainer commandContainer = this.redisCommandsContainer;
         try {
-            ttlStage = issueTtl(key);
+            ttlStage = issueTtl(commandContainer, key);
         } catch (Exception e) {
             if (attemptsRemaining > 0) {
-                LOG.warn("set TTL failed for key: {}, retrying (remaining={})", key, attemptsRemaining, e);
-                attemptTtl(record, attemptsRemaining - 1, completion);
+                logRetryableFailure("set TTL failed", key, attemptsRemaining, e);
+                scheduleRetry(
+                        key,
+                        commandContainer,
+                        e,
+                        attemptsRemaining,
+                        () -> attemptTtl(record, attemptsRemaining - 1, completion),
+                        completion);
             } else {
                 recordAsyncFailure(key, e);
                 completion.complete(null);
@@ -570,12 +723,15 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                     if (t == null) {
                         completion.complete(null);
                     } else if (attemptsRemaining > 0) {
-                        LOG.warn(
-                                "set TTL failed for key: {}, retrying (remaining={})",
+                        logRetryableFailure(
+                                "set TTL failed", key, attemptsRemaining, (Throwable) t);
+                        scheduleRetry(
                                 key,
+                                commandContainer,
+                                (Throwable) t,
                                 attemptsRemaining,
-                                (Throwable) t);
-                        attemptTtl(record, attemptsRemaining - 1, completion);
+                                () -> attemptTtl(record, attemptsRemaining - 1, completion),
+                                completion);
                     } else {
                         recordAsyncFailure(key, (Throwable) t);
                         completion.complete(null);
@@ -585,8 +741,11 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
     /** Records an async failure so it is later propagated to Flink via {@link #checkAsyncError()}. */
     private void recordAsyncFailure(String key, Throwable t) {
-        LOG.error("Async Redis write failed for key: {}", key, t);
-        asyncError.compareAndSet(null, t);
+        if (asyncError.compareAndSet(null, t)) {
+            LOG.error("Async Redis write failed for key: {}", key, t);
+        } else {
+            LOG.warn("Additional async Redis write failure for key: {}: {}", key, t.toString());
+        }
         if (numRecordsSendErrorsCounter != null) {
             numRecordsSendErrorsCounter.inc();
         }
@@ -638,10 +797,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
      * firing it and forgetting it, so a checkpoint cannot succeed while the range cleanup is still
      * pending or has failed.
      */
-    private CompletionStage<?> zaddWithRangeCleanup(String[] params) {
+    private CompletionStage<?> zaddWithRangeCleanup(
+            RedisCommandsContainer commandsContainer, String[] params) {
         RedisFuture<?> zaddFuture =
-                this.redisCommandsContainer.zadd(
-                        params[0], Double.parseDouble(params[1]), params[2]);
+                commandsContainer.zadd(params[0], Double.parseDouble(params[1]), params[2]);
         if (zremrangeby == null) {
             return zaddFuture;
         }
@@ -654,7 +813,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                         return;
                     }
                     try {
-                        RedisFuture<?> cleanup = issueZremRange(params);
+                        RedisFuture<?> cleanup = issueZremRange(commandsContainer, params);
                         if (cleanup == null) {
                             // Unrecognized zrem type: nothing to clean up, ZADD already succeeded.
                             result.complete(r);
@@ -679,16 +838,17 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
      * Issues the configured ZREMRANGEBY* cleanup command, or {@code null} when {@code
      * zset.zremrangeby} is not a recognized type.
      */
-    private RedisFuture<?> issueZremRange(String[] params) {
+    private RedisFuture<?> issueZremRange(
+            RedisCommandsContainer commandsContainer, String[] params) {
         if (zremrangeby.equalsIgnoreCase(ZremType.SCORE.name())) {
             Range<Double> range =
                     Range.create(Double.parseDouble(params[3]), Double.parseDouble(params[4]));
-            return this.redisCommandsContainer.zremRangeByScore(params[0], range);
+            return commandsContainer.zremRangeByScore(params[0], range);
         } else if (zremrangeby.equalsIgnoreCase(ZremType.LEX.name())) {
             Range<String> range = Range.create(params[3], params[4]);
-            return this.redisCommandsContainer.zremRangeByLex(params[0], range);
+            return commandsContainer.zremRangeByLex(params[0], range);
         } else if (zremrangeby.equalsIgnoreCase(ZremType.RANK.name())) {
-            return this.redisCommandsContainer.zremRangeByRank(
+            return commandsContainer.zremRangeByRank(
                     params[0], Long.parseLong(params[3]), Long.parseLong(params[4]));
         }
         LOG.warn("Unrecognized zrem type:{}", zremrangeby);
@@ -728,63 +888,60 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         }
     }
 
-    private CompletionStage sink(String[] params) {
+    private CompletionStage sink(RedisCommandsContainer commandsContainer, String[] params) {
         CompletionStage redisFuture = null;
         switch (redisCommand.getInsertCommand()) {
             case RPUSH:
-                redisFuture = this.redisCommandsContainer.rpush(params[0], params[1]);
+                redisFuture = commandsContainer.rpush(params[0], params[1]);
                 break;
             case LPUSH:
-                redisFuture = this.redisCommandsContainer.lpush(params[0], params[1]);
+                redisFuture = commandsContainer.lpush(params[0], params[1]);
                 break;
             case SADD:
-                redisFuture = this.redisCommandsContainer.sadd(params[0], params[1]);
+                redisFuture = commandsContainer.sadd(params[0], params[1]);
                 break;
             case SET: {
                 if (!this.setIfAbsent) {
-                    redisFuture = this.redisCommandsContainer.set(params[0], params[1]);
+                    redisFuture = commandsContainer.set(params[0], params[1]);
                 } else {
                     // Cover the real SET (not just EXISTS) with retry/flush/error tracking by
                     // completing only after the actual write finishes.
                     redisFuture =
                             conditionalWrite(
-                                    this.redisCommandsContainer.exists(params[0]),
+                                    commandsContainer.exists(params[0]),
                                     val -> ((Number) val).intValue() == 0,
-                                    () -> this.redisCommandsContainer.set(params[0], params[1]));
+                                    () -> commandsContainer.set(params[0], params[1]));
                 }
             }
                 break;
             case PFADD:
-                redisFuture = this.redisCommandsContainer.pfadd(params[0], params[1]);
+                redisFuture = commandsContainer.pfadd(params[0], params[1]);
                 break;
             case PUBLISH:
-                redisFuture = this.redisCommandsContainer.publish(params[0], params[1]);
+                redisFuture = commandsContainer.publish(params[0], params[1]);
                 break;
             case ZADD:
-                redisFuture = zaddWithRangeCleanup(params);
+                redisFuture = zaddWithRangeCleanup(commandsContainer, params);
                 break;
             case ZINCRBY:
                 redisFuture =
-                        this.redisCommandsContainer.zincrBy(
-                                params[0], Double.valueOf(params[1]), params[2]);
+                        commandsContainer.zincrBy(params[0], Double.valueOf(params[1]), params[2]);
                 break;
             case ZREM:
-                redisFuture = this.redisCommandsContainer.zrem(params[0], params[1]);
+                redisFuture = commandsContainer.zrem(params[0], params[1]);
                 break;
             case SREM:
-                redisFuture = this.redisCommandsContainer.srem(params[0], params[1]);
+                redisFuture = commandsContainer.srem(params[0], params[1]);
                 break;
             case HSET: {
                 if (!this.setIfAbsent) {
-                    redisFuture =
-                            this.redisCommandsContainer.hset(params[0], params[1], params[2]);
+                    redisFuture = commandsContainer.hset(params[0], params[1], params[2]);
                 } else {
                     redisFuture =
                             conditionalWrite(
-                                    this.redisCommandsContainer.hexists(params[0], params[1]),
+                                    commandsContainer.hexists(params[0], params[1]),
                                     exist -> Boolean.FALSE.equals(exist),
-                                    () -> this.redisCommandsContainer.hset(
-                                            params[0], params[1], params[2]));
+                                    () -> commandsContainer.hset(params[0], params[1], params[2]));
                 }
             }
                 break;
@@ -800,46 +957,42 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                     hashField.put(params[i], params[++i]);
                 }
                 if (!this.setIfAbsent) {
-                    redisFuture = this.redisCommandsContainer.hmset(params[0], hashField);
+                    redisFuture = commandsContainer.hmset(params[0], hashField);
                 } else {
                     // EXISTS returns Long (0/1); the previous code cast it to Boolean, which threw
                     // ClassCastException at runtime. Use a numeric check and cover the real HMSET.
                     redisFuture =
                             conditionalWrite(
-                                    this.redisCommandsContainer.exists(params[0]),
+                                    commandsContainer.exists(params[0]),
                                     val -> ((Number) val).intValue() == 0,
-                                    () -> this.redisCommandsContainer.hmset(params[0], hashField));
+                                    () -> commandsContainer.hmset(params[0], hashField));
                 }
             }
                 break;
             case HINCRBY:
                 redisFuture =
-                        this.redisCommandsContainer.hincrBy(
-                                params[0], params[1], Long.valueOf(params[2]));
+                        commandsContainer.hincrBy(params[0], params[1], Long.valueOf(params[2]));
                 break;
             case HINCRBYFLOAT:
                 redisFuture =
-                        this.redisCommandsContainer.hincrByFloat(
+                        commandsContainer.hincrByFloat(
                                 params[0], params[1], Double.valueOf(params[2]));
                 break;
             case INCRBY:
-                redisFuture =
-                        this.redisCommandsContainer.incrBy(params[0], Long.valueOf(params[1]));
+                redisFuture = commandsContainer.incrBy(params[0], Long.valueOf(params[1]));
                 break;
             case INCRBYFLOAT:
                 redisFuture =
-                        this.redisCommandsContainer.incrByFloat(
-                                params[0], Double.valueOf(params[1]));
+                        commandsContainer.incrByFloat(params[0], Double.valueOf(params[1]));
                 break;
             case DECRBY:
-                redisFuture =
-                        this.redisCommandsContainer.decrBy(params[0], Long.valueOf(params[1]));
+                redisFuture = commandsContainer.decrBy(params[0], Long.valueOf(params[1]));
                 break;
             case DEL:
-                redisFuture = this.redisCommandsContainer.del(params[0]);
+                redisFuture = commandsContainer.del(params[0]);
                 break;
             case HDEL:
-                redisFuture = this.redisCommandsContainer.hdel(params[0], params[1]);
+                redisFuture = commandsContainer.hdel(params[0], params[1]);
                 break;
             default:
                 throw new UnsupportedOperationException(
@@ -848,43 +1001,40 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         return redisFuture;
     }
 
-    private RedisFuture rowKindDelete(String[] params) {
+    private RedisFuture rowKindDelete(RedisCommandsContainer commandsContainer, String[] params) {
         RedisFuture redisFuture = null;
         switch (redisCommand.getDeleteCommand()) {
             case SREM:
-                redisFuture = this.redisCommandsContainer.srem(params[0], params[1]);
+                redisFuture = commandsContainer.srem(params[0], params[1]);
                 break;
             case DEL:
-                redisFuture = this.redisCommandsContainer.del(params[0]);
+                redisFuture = commandsContainer.del(params[0]);
                 break;
             case ZREM:
-                redisFuture = this.redisCommandsContainer.zrem(params[0], params[2]);
+                redisFuture = commandsContainer.zrem(params[0], params[2]);
                 break;
             case ZINCRBY:
                 Double d = -Double.valueOf(params[1]);
-                redisFuture = this.redisCommandsContainer.zincrBy(params[0], d, params[2]);
+                redisFuture = commandsContainer.zincrBy(params[0], d, params[2]);
                 break;
             case HDEL:
-                redisFuture = this.redisCommandsContainer.hdel(params[0], params[1]);
+                redisFuture = commandsContainer.hdel(params[0], params[1]);
                 break;
             case HINCRBY:
                 redisFuture =
-                        this.redisCommandsContainer.hincrBy(
-                                params[0], params[1], -Long.valueOf(params[2]));
+                        commandsContainer.hincrBy(params[0], params[1], -Long.valueOf(params[2]));
                 break;
             case HINCRBYFLOAT:
                 redisFuture =
-                        this.redisCommandsContainer.hincrByFloat(
+                        commandsContainer.hincrByFloat(
                                 params[0], params[1], -Double.valueOf(params[2]));
                 break;
             case INCRBY:
-                redisFuture =
-                        this.redisCommandsContainer.incrBy(params[0], -Long.valueOf(params[1]));
+                redisFuture = commandsContainer.incrBy(params[0], -Long.valueOf(params[1]));
                 break;
             case INCRBYFLOAT:
                 redisFuture =
-                        this.redisCommandsContainer.incrByFloat(
-                                params[0], -Double.valueOf(params[1]));
+                        commandsContainer.incrByFloat(params[0], -Double.valueOf(params[1]));
                 break;
         }
         return redisFuture;
@@ -896,18 +1046,19 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
      * The returned stage lets the caller fold TTL into the record's completion/retry/error
      * tracking instead of firing it and forgetting it.
      */
-    private CompletionStage<?> issueTtl(String key) {
+    private CompletionStage<?> issueTtl(RedisCommandsContainer commandsContainer, String key) {
         if (redisCommand == RedisCommand.DEL) {
             return null;
         }
 
         if (ttl != null) {
             if (ttlKeyNotAbsent) {
-                return expireIfNoTtl(key, () -> ttl);
+                return expireIfNoTtl(commandsContainer, key, () -> ttl);
             }
-            return this.redisCommandsContainer.expire(key, ttl);
+            return commandsContainer.expire(key, ttl);
         } else if (expireTimeSeconds != -1) {
             return expireIfNoTtl(
+                    commandsContainer,
                     key,
                     () -> {
                         int now = LocalTime.now().toSecondOfDay();
@@ -923,9 +1074,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
      * Sets an expiry on {@code key} only if it currently has no TTL. Returns a stage that completes
      * after the EXPIRE (or immediately when the key already has a TTL / the check fails).
      */
-    private CompletionStage<?> expireIfNoTtl(String key, Supplier<Integer> secondsSupplier) {
+    private CompletionStage<?> expireIfNoTtl(
+            RedisCommandsContainer commandsContainer, String key, Supplier<Integer> secondsSupplier) {
         CompletableFuture<Object> result = new CompletableFuture<>();
-        this.redisCommandsContainer
+        commandsContainer
                 .getTTL(key)
                 .whenComplete(
                         (currentTtl, h) -> {
@@ -935,7 +1087,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                             }
                             try {
                                 if (currentTtl != null && currentTtl < 0) {
-                                    this.redisCommandsContainer
+                                    commandsContainer
                                             .expire(key, secondsSupplier.get())
                                             .whenComplete(
                                                     (r, e) -> {

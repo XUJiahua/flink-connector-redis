@@ -57,7 +57,7 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
 
     @Test
     public void testFlushSurfacesConnectionClosedFromPendingAsyncWrites() throws Exception {
-        Configuration config = sinkConfig();
+        Configuration config = sinkConfig(0);
         RedisSinkWriter writer = createWriter(config);
 
         try {
@@ -85,6 +85,34 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
         }
     }
 
+    @Test
+    public void testConnectionClosedIsRetriedAfterRebuildingConnection() throws Exception {
+        String key = "connection_closed_retry_key";
+        String value = "retry-value";
+        singleRedisCommands.del(key);
+
+        Configuration config = sinkConfig(1);
+        RedisSinkWriter writer = createWriter(config);
+
+        try {
+            List<ManualRedisFuture<String>> setFutures = new ArrayList<>();
+            RedisCommandsContainer originalContainer =
+                    replaceCommandsContainer(writer, pendingSetContainer(setFutures));
+            originalContainer.close();
+
+            writer.write(record(key, value), null);
+            assertEquals(1, setFutures.size());
+
+            setFutures.get(0).completeExceptionally(new RedisException("Connection closed"));
+
+            writer.flush(false);
+            assertEquals(value, singleRedisCommands.get(key));
+        } finally {
+            writer.close();
+            singleRedisCommands.del(key);
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static RedisSinkWriter createWriter(Configuration config) {
         FlinkSingleConfig flinkConfig =
@@ -102,11 +130,11 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
         return new RedisSinkWriter(flinkConfig, mapper, columnDataTypes, config, null, 1, null);
     }
 
-    private static Configuration sinkConfig() {
+    private static Configuration sinkConfig(int maxRetries) {
         Configuration config = new Configuration();
         config.set(RedisOptions.SINK_BATCH_SIZE, 1);
         config.set(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS, 10);
-        config.set(RedisOptions.MAX_RETRIES, 0);
+        config.set(RedisOptions.MAX_RETRIES, maxRetries);
         return config;
     }
 
