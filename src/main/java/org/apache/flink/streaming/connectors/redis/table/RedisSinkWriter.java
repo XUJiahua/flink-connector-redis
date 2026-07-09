@@ -632,6 +632,70 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     }
 
     /**
+     * Issues a ZADD and, when {@code zset.zremrangeby} is configured, chains the range-cleanup
+     * command (ZREMRANGEBYSCORE/LEX/RANK) so the returned stage completes only after the cleanup
+     * finishes. This folds the cleanup into the record's completion/retry/error tracking instead of
+     * firing it and forgetting it, so a checkpoint cannot succeed while the range cleanup is still
+     * pending or has failed.
+     */
+    private CompletionStage<?> zaddWithRangeCleanup(String[] params) {
+        RedisFuture<?> zaddFuture =
+                this.redisCommandsContainer.zadd(
+                        params[0], Double.parseDouble(params[1]), params[2]);
+        if (zremrangeby == null) {
+            return zaddFuture;
+        }
+
+        CompletableFuture<Object> result = new CompletableFuture<>();
+        zaddFuture.whenComplete(
+                (r, thr) -> {
+                    if (thr != null) {
+                        result.completeExceptionally(thr);
+                        return;
+                    }
+                    try {
+                        RedisFuture<?> cleanup = issueZremRange(params);
+                        if (cleanup == null) {
+                            // Unrecognized zrem type: nothing to clean up, ZADD already succeeded.
+                            result.complete(r);
+                            return;
+                        }
+                        cleanup.whenComplete(
+                                (cr, ct) -> {
+                                    if (ct != null) {
+                                        result.completeExceptionally(ct);
+                                    } else {
+                                        result.complete(cr);
+                                    }
+                                });
+                    } catch (Throwable e) {
+                        result.completeExceptionally(e);
+                    }
+                });
+        return result;
+    }
+
+    /**
+     * Issues the configured ZREMRANGEBY* cleanup command, or {@code null} when {@code
+     * zset.zremrangeby} is not a recognized type.
+     */
+    private RedisFuture<?> issueZremRange(String[] params) {
+        if (zremrangeby.equalsIgnoreCase(ZremType.SCORE.name())) {
+            Range<Double> range =
+                    Range.create(Double.parseDouble(params[3]), Double.parseDouble(params[4]));
+            return this.redisCommandsContainer.zremRangeByScore(params[0], range);
+        } else if (zremrangeby.equalsIgnoreCase(ZremType.LEX.name())) {
+            Range<String> range = Range.create(params[3], params[4]);
+            return this.redisCommandsContainer.zremRangeByLex(params[0], range);
+        } else if (zremrangeby.equalsIgnoreCase(ZremType.RANK.name())) {
+            return this.redisCommandsContainer.zremRangeByRank(
+                    params[0], Long.parseLong(params[3]), Long.parseLong(params[4]));
+        }
+        LOG.warn("Unrecognized zrem type:{}", zremrangeby);
+        return null;
+    }
+
+    /**
      * Waits for all currently in-flight record completion promises to resolve.
      * Called during flush and close to ensure data consistency at checkpoint boundaries. Promises
      * resolve only after the whole write (including retries and follow-up commands) finishes, so
@@ -697,37 +761,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 redisFuture = this.redisCommandsContainer.publish(params[0], params[1]);
                 break;
             case ZADD:
-                redisFuture =
-                        this.redisCommandsContainer.zadd(
-                                params[0], Double.parseDouble(params[1]), params[2]);
-                if (zremrangeby != null) {
-                    redisFuture.whenComplete(
-                            (ignore, throwable) -> {
-                                try {
-                                    if (zremrangeby.equalsIgnoreCase(ZremType.SCORE.name())) {
-                                        Range<Double> range =
-                                                Range.create(
-                                                        Double.parseDouble(params[3]),
-                                                        Double.parseDouble(params[4]));
-                                        this.redisCommandsContainer.zremRangeByScore(
-                                                params[0], range);
-                                    } else if (zremrangeby.equalsIgnoreCase(ZremType.LEX.name())) {
-                                        Range<String> range = Range.create(params[3], params[4]);
-                                        this.redisCommandsContainer.zremRangeByLex(
-                                                params[0], range);
-                                    } else if (zremrangeby.equalsIgnoreCase(ZremType.RANK.name())) {
-                                        this.redisCommandsContainer.zremRangeByRank(
-                                                params[0],
-                                                Long.parseLong(params[3]),
-                                                Long.parseLong(params[4]));
-                                    } else {
-                                        LOG.warn("Unrecognized zrem type:{}", zremrangeby);
-                                    }
-                                } catch (Exception e) {
-                                    LOG.error("{} zremRangeBy failed.", params[0], e);
-                                }
-                            });
-                }
+                redisFuture = zaddWithRangeCleanup(params);
                 break;
             case ZINCRBY:
                 redisFuture =
