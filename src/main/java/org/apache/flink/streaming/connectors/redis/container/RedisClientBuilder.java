@@ -25,8 +25,11 @@ import org.apache.flink.streaming.connectors.redis.config.FlinkSingleConfig;
 import org.apache.flink.util.StringUtils;
 
 import io.lettuce.core.AbstractRedisClient;
+import io.lettuce.core.ClientOptions;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
+import io.lettuce.core.SocketOptions;
+import io.lettuce.core.TimeoutOptions;
 import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.ClusterTopologyRefreshOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
@@ -93,11 +96,16 @@ public class RedisClientBuilder {
                         .withHost(singleConfig.getHost())
                         .withPort(singleConfig.getPort())
                         .withDatabase(singleConfig.getDatabase());
+        if (singleConfig.getConnectionTimeout() > 0) {
+            builder.withTimeout(Duration.ofMillis(singleConfig.getConnectionTimeout()));
+        }
         if (!StringUtils.isNullOrWhitespaceOnly(singleConfig.getPassword())) {
             builder.withPassword(singleConfig.getPassword().toCharArray());
         }
 
-        return RedisClient.create(clientResources, builder.build());
+        RedisClient redisClient = RedisClient.create(clientResources, builder.build());
+        redisClient.setOptions(buildClientOptions(singleConfig));
+        return redisClient;
     }
 
     /**
@@ -120,6 +128,11 @@ public class RedisClientBuilder {
                                             RedisURI.builder()
                                                     .withHost(redis[0])
                                                     .withPort(Integer.parseInt(redis[1]));
+                                    if (clusterConfig.getConnectionTimeout() > 0) {
+                                        builder.withTimeout(
+                                                Duration.ofMillis(
+                                                        clusterConfig.getConnectionTimeout()));
+                                    }
                                     if (!StringUtils.isNullOrWhitespaceOnly(
                                             clusterConfig.getPassword())) {
                                         builder.withPassword(
@@ -139,10 +152,10 @@ public class RedisClientBuilder {
                         .adaptiveRefreshTriggersTimeout(Duration.ofSeconds(10L))
                         .build();
 
-        clusterClient.setOptions(
-                ClusterClientOptions.builder()
-                        .topologyRefreshOptions(topologyRefreshOptions)
-                        .build());
+        ClusterClientOptions.Builder clusterOptionsBuilder =
+                ClusterClientOptions.builder().topologyRefreshOptions(topologyRefreshOptions);
+        applyResilienceOptions(clusterOptionsBuilder, clusterConfig);
+        clusterClient.setOptions(clusterOptionsBuilder.build());
 
         return clusterClient;
     }
@@ -160,6 +173,9 @@ public class RedisClientBuilder {
                 RedisURI.builder()
                         .withSentinelMasterId(sentinelConfig.getMasterName())
                         .withDatabase(sentinelConfig.getDatabase());
+        if (sentinelConfig.getConnectionTimeout() > 0) {
+            builder.withTimeout(Duration.ofMillis(sentinelConfig.getConnectionTimeout()));
+        }
 
         Arrays.stream(sentinelConfig.getSentinelsInfo().split(","))
                 .forEach(
@@ -179,6 +195,46 @@ public class RedisClientBuilder {
                             }
                         });
 
-        return RedisClient.create(clientResources, builder.build());
+        RedisClient redisClient = RedisClient.create(clientResources, builder.build());
+        redisClient.setOptions(buildClientOptions(sentinelConfig));
+        return redisClient;
+    }
+
+    /**
+     * Builds {@link ClientOptions} for non-cluster clients with connection resiliency settings:
+     * TCP connect timeout, auto-reconnect and a per-command timeout. Without a command timeout, a
+     * stalled or half-open connection leaves async command futures pending forever, which starves
+     * the sink's in-flight backpressure permits and eventually fails the whole task/job.
+     */
+    private static ClientOptions buildClientOptions(FlinkConfigBase config) {
+        ClientOptions.Builder builder = ClientOptions.builder();
+        applyResilienceOptions(builder, config);
+        return builder.build();
+    }
+
+    /**
+     * Applies shared connection resiliency settings to any {@link ClientOptions.Builder} (including
+     * {@link ClusterClientOptions.Builder}).
+     */
+    private static void applyResilienceOptions(
+            ClientOptions.Builder builder, FlinkConfigBase config) {
+        builder.autoReconnect(true);
+
+        int connectTimeoutMs = config.getConnectionTimeout();
+        if (connectTimeoutMs > 0) {
+            builder.socketOptions(
+                    SocketOptions.builder()
+                            .connectTimeout(Duration.ofMillis(connectTimeoutMs))
+                            .build());
+        }
+
+        Integer commandTimeoutMs =
+                config.getLettuceConfig() != null
+                        ? config.getLettuceConfig().getCommandTimeoutMs()
+                        : null;
+        if (commandTimeoutMs != null && commandTimeoutMs > 0) {
+            builder.timeoutOptions(
+                    TimeoutOptions.enabled(Duration.ofMillis(commandTimeoutMs)));
+        }
     }
 }

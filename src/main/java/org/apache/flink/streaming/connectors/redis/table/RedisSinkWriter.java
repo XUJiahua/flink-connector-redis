@@ -386,60 +386,103 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
     /**
      * Sends a single record to Redis with retry logic and tracks the in-flight future.
+     *
+     * <p>The backpressure permit acquired by {@link #acquireInFlightPermit()} in {@link
+     * #flushBuffer()} is owned by this send: it is released exactly once when the command finally
+     * completes (successfully or after all retries are exhausted). On a synchronous failure the
+     * permit is released by the caller ({@link #flushBuffer()}), which then propagates the error.
      */
     private void sendRecord(PendingRecord record) throws Exception {
-        for (int i = 0; i <= maxRetryTimes; i++) {
-            try {
-                RedisFuture redisFuture = null;
-                if (record.kind == RowKind.DELETE) {
-                    redisFuture = rowKindDelete(record.params);
-                } else {
-                    redisFuture = sink(record.params);
-                }
+        submitWithRetry(record, this.maxRetryTimes);
+    }
 
-                if (redisFuture != null) {
-                    // Track the future for flush completion
+    /**
+     * Issues the command for a record and, on failure, re-issues it up to {@code attemptsRemaining}
+     * more times before surfacing the error. Bounded async retry means a transient async failure
+     * (e.g. a brief connection blip or a command timeout) is retried instead of immediately failing
+     * the whole Flink job, while still preserving at-least-once semantics: once all retries are
+     * exhausted the error is recorded and later re-thrown from {@link #checkAsyncError()} so Flink
+     * can restart from the last checkpoint.
+     */
+    private void submitWithRetry(PendingRecord record, int attemptsRemaining) throws Exception {
+        RedisFuture redisFuture;
+        try {
+            if (record.kind == RowKind.DELETE) {
+                redisFuture = rowKindDelete(record.params);
+            } else {
+                redisFuture = sink(record.params);
+            }
+        } catch (UnsupportedOperationException e) {
+            // Non-retryable configuration error; permit released by flushBuffer's handler.
+            throw e;
+        } catch (Exception e) {
+            // Synchronous failure issuing the command.
+            if (attemptsRemaining > 0) {
+                LOG.warn(
+                        "sink redis error when issuing command, remaining retries:{}",
+                        attemptsRemaining,
+                        e);
+                submitWithRetry(record, attemptsRemaining - 1);
+                return;
+            }
+            throw new RuntimeException("sink redis error ", e);
+        }
+
+        if (redisFuture == null) {
+            // No future returned, release permit immediately.
+            inFlightSemaphore.release();
+            return;
+        }
+
+        // Track the future for flush completion.
+        synchronized (inFlightFutures) {
+            inFlightFutures.add(redisFuture);
+        }
+
+        final RedisFuture<?> trackedFuture = redisFuture;
+        redisFuture.whenComplete(
+                (r, t) -> {
+                    // Remove from tracked futures first.
                     synchronized (inFlightFutures) {
-                        inFlightFutures.add(redisFuture);
+                        inFlightFutures.remove(trackedFuture);
                     }
 
-                    // Register completion callback for backpressure release and error tracking
-                    final RedisFuture<?> trackedFuture = redisFuture;
-                    redisFuture.whenComplete((r, t) -> {
-                        // Release the backpressure permit
-                        inFlightSemaphore.release();
-                        // Set TTL
+                    if (t == null) {
+                        // Success: set TTL and release the backpressure permit.
                         setTtl(record.params[0]);
-                        // Track async errors
-                        if (t != null) {
-                            LOG.error("Async Redis write failed for key: {}", record.params[0], (Throwable) t);
-                            asyncError.compareAndSet(null, (Throwable) t);
-                            if (numRecordsSendErrorsCounter != null) {
-                                numRecordsSendErrorsCounter.inc();
-                            }
-                        }
-                        // Remove from tracked futures
-                        synchronized (inFlightFutures) {
-                            inFlightFutures.remove(trackedFuture);
-                        }
-                    });
-                } else {
-                    // No future returned, release permit immediately
-                    inFlightSemaphore.release();
-                }
+                        inFlightSemaphore.release();
+                        return;
+                    }
 
-                break;
-            } catch (UnsupportedOperationException e) {
-                inFlightSemaphore.release();
-                throw e;
-            } catch (Exception e1) {
-                LOG.error("sink redis error, retry times:{}", i, e1);
-                if (i >= this.maxRetryTimes) {
-                    inFlightSemaphore.release();
-                    throw new RuntimeException("sink redis error ", e1);
-                }
-                Thread.sleep(500L * i);
-            }
+                    if (attemptsRemaining > 0) {
+                        // Transient async failure: re-issue instead of failing the whole job. The
+                        // permit is held across the retry (released by the new future's callback).
+                        LOG.warn(
+                                "Async Redis write failed for key: {}, retrying (remaining={})",
+                                record.params[0],
+                                attemptsRemaining,
+                                (Throwable) t);
+                        try {
+                            submitWithRetry(record, attemptsRemaining - 1);
+                        } catch (Exception e) {
+                            recordAsyncFailure(record.params[0], e);
+                            inFlightSemaphore.release();
+                        }
+                    } else {
+                        // Retries exhausted: record the error (surfaced by checkAsyncError) and
+                        // release the permit.
+                        recordAsyncFailure(record.params[0], (Throwable) t);
+                        inFlightSemaphore.release();
+                    }
+                });
+    }
+
+    /** Records an async failure so it is later propagated to Flink via {@link #checkAsyncError()}. */
+    private void recordAsyncFailure(String key, Throwable t) {
+        LOG.error("Async Redis write failed for key: {}", key, t);
+        asyncError.compareAndSet(null, t);
+        if (numRecordsSendErrorsCounter != null) {
+            numRecordsSendErrorsCounter.inc();
         }
     }
 

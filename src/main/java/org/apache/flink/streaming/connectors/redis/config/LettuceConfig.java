@@ -27,9 +27,18 @@ public class LettuceConfig implements Serializable {
 
     private final Integer nettyEventPoolSize;
 
+    /** Per-command timeout in milliseconds; {@code null} or <= 0 disables per-command timeouts. */
+    private final Integer commandTimeoutMs;
+
     public LettuceConfig(Integer nettyIoPoolSize, Integer nettyEventPoolSize) {
+        this(nettyIoPoolSize, nettyEventPoolSize, null);
+    }
+
+    public LettuceConfig(
+            Integer nettyIoPoolSize, Integer nettyEventPoolSize, Integer commandTimeoutMs) {
         this.nettyIoPoolSize = nettyIoPoolSize;
         this.nettyEventPoolSize = nettyEventPoolSize;
+        this.commandTimeoutMs = commandTimeoutMs;
     }
 
     public Integer getNettyIoPoolSize() {
@@ -40,6 +49,10 @@ public class LettuceConfig implements Serializable {
         return nettyEventPoolSize;
     }
 
+    public Integer getCommandTimeoutMs() {
+        return commandTimeoutMs;
+    }
+
     @Override
     public String toString() {
         return "LettuceConfig{"
@@ -47,6 +60,8 @@ public class LettuceConfig implements Serializable {
                 + nettyIoPoolSize
                 + ", nettyEventPoolSize="
                 + nettyEventPoolSize
+                + ", commandTimeoutMs="
+                + commandTimeoutMs
                 + '}';
     }
 }

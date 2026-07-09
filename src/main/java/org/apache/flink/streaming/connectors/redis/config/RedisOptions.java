@@ -29,6 +29,18 @@ public class RedisOptions {
                     .intType()
                     .defaultValue(2000)
                     .withDescription("Optional timeout for connect to redis");
+    public static final ConfigOption<Integer> COMMAND_TIMEOUT =
+            ConfigOptions.key("command.timeout")
+                    .intType()
+                    .defaultValue(10000)
+                    .withDescription(
+                            "Optional per-command timeout in milliseconds applied to Lettuce "
+                                    + "commands. When a Redis command does not complete within this "
+                                    + "time (e.g. the connection stalls or the server stops "
+                                    + "responding) the command future fails fast so the in-flight "
+                                    + "backpressure permit is released and the write can be retried, "
+                                    + "instead of hanging until the whole task fails. A value <= 0 "
+                                    + "disables per-command timeouts.");
     public static final ConfigOption<Integer> MAXTOTAL =
             ConfigOptions.key("maxTotal")
                     .intType()

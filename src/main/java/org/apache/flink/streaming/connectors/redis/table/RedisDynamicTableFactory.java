@@ -90,6 +90,7 @@ public class RedisDynamicTableFactory
         options.add(RedisOptions.CLUSTERNODES);
         options.add(RedisOptions.PASSWORD);
         options.add(RedisOptions.TIMEOUT);
+        options.add(RedisOptions.COMMAND_TIMEOUT);
         options.add(RedisOptions.MINIDLE);
         options.add(RedisOptions.REDISMODE);
         options.add(RedisOptions.TTL);

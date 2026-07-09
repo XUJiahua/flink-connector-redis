@@ -40,7 +40,8 @@ public class FlinkClusterConfigHandler implements FlinkConfigHandler {
         LettuceConfig lettuceConfig =
                 new LettuceConfig(
                         config.get(RedisOptions.NETTY_IO_POOL_SIZE),
-                        config.get(RedisOptions.NETTY_EVENT_POOL_SIZE));
+                        config.get(RedisOptions.NETTY_EVENT_POOL_SIZE),
+                        config.get(RedisOptions.COMMAND_TIMEOUT));
 
         FlinkClusterConfig.Builder builder =
                 new FlinkClusterConfig.Builder()
