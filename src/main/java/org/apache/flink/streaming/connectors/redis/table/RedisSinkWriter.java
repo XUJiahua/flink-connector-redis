@@ -53,10 +53,14 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /** Sink writer for Redis using Sink V2 API with mini-batch buffering and backpressure. */
 public class RedisSinkWriter implements SinkWriter<RowData> {
@@ -91,6 +95,11 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final int maxInFlightRequests;
     private transient Semaphore inFlightSemaphore;
 
+    // Upper bound for how long flush()/close() waits on a single record's completion promise.
+    // Derived from the per-command timeout and the retry budget so a record is not aborted by the
+    // flush wait before its own bounded retries have had a chance to run.
+    private final long flushWaitTimeoutMs;
+
     // --- Write QPS rate limiting ---
     private final long writeQps;
     private final double writeQpsBurstSeconds;
@@ -106,8 +115,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     // --- Async error tracking ---
     private transient AtomicReference<Throwable> asyncError;
 
-    // --- In-flight futures for flush ---
-    private transient List<RedisFuture<?>> inFlightFutures;
+    // --- In-flight per-record completion promises for flush ---
+    // One promise per logical record write. It completes (normally) only once the whole write
+    // finally resolves, i.e. after all bounded retries AND any follow-up command (e.g. the actual
+    // SET/HSET for set.if.absent). Flush waits on these promises so a transient failure that is
+    // still being retried does not abort the checkpoint; the terminal error, if any, is carried by
+    // {@link #asyncError} and surfaced via {@link #checkAsyncError()}.
+    private transient List<CompletableFuture<Void>> inFlightCompletions;
 
     /** Holds a buffered record before it is sent to Redis. */
     private static class PendingRecord {
@@ -191,7 +205,21 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         this.lastFlushTimeMs = System.currentTimeMillis();
         this.inFlightSemaphore = new Semaphore(maxInFlightRequests);
         this.asyncError = new AtomicReference<>(null);
-        this.inFlightFutures = new ArrayList<>();
+        this.inFlightCompletions = new ArrayList<>();
+
+        // Derive the flush-wait upper bound from the Lettuce per-command timeout and the retry
+        // budget. A record's completion promise covers the whole write + TTL retry chain, where
+        // each attempt may issue up to two sequential Redis commands (e.g. EXISTS+SET or
+        // GETTTL+EXPIRE) for both the write and the TTL. So the worst-case sequential command count
+        // is ~4 * (maxRetryTimes + 1). When no command timeout is configured (<= 0), fall back to a
+        // 60s floor. This prevents flush from aborting a record before its own retries can run.
+        Integer commandTimeoutMs =
+                flinkConfigBase.getLettuceConfig() != null
+                        ? flinkConfigBase.getLettuceConfig().getCommandTimeoutMs()
+                        : null;
+        long perCommandMs = (commandTimeoutMs != null && commandTimeoutMs > 0) ? commandTimeoutMs : 60_000L;
+        this.flushWaitTimeoutMs =
+                Math.max(60_000L, perCommandMs * 4L * (this.maxRetryTimes + 1L) + 5_000L);
 
         // Initialize write-QPS rate limiter. The configured QPS is the total budget for the whole
         // sink, so each subtask gets an equal share.
@@ -249,8 +277,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     public void flush(boolean endOfInput) throws IOException, InterruptedException {
         // Flush remaining buffered records
         flushBuffer();
-        // Wait for ALL in-flight futures to complete
-        waitForInFlightFutures();
+        // Wait for ALL in-flight record writes (including retries and follow-up commands) to
+        // complete before checking for errors.
+        waitForInFlightCompletions();
         // Check for async errors
         checkAsyncError();
     }
@@ -260,7 +289,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         // Flush remaining records before closing
         try {
             flushBuffer();
-            waitForInFlightFutures();
+            waitForInFlightCompletions();
         } catch (Exception e) {
             LOG.warn("Error during final flush on close", e);
         }
@@ -289,15 +318,23 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                     cooperativeWait(rateLimiter.reserve(1));
                 }
 
+                // Surface async errors BEFORE acquiring a permit, so a pending failure cannot leak
+                // the just-acquired permit before it is handed off to the completion promise.
+                checkAsyncError();
+
                 // Backpressure: acquire a permit, again yielding to the mailbox while waiting so a
                 // slow Redis does not freeze the task thread for the whole timeout.
                 acquireInFlightPermit();
 
-                // Check for async errors before sending more
-                checkAsyncError();
-
+                // Ownership of the acquired permit is handed to the per-record completion promise
+                // created inside sendRecord; it is released exactly once when that promise
+                // completes. sendRecord does not throw for command failures (they are routed to
+                // asyncError). The finally guard only releases the permit if the hand-off itself
+                // failed before sendRecord could take ownership, so the permit is never leaked.
+                boolean handedOff = false;
                 try {
                     sendRecord(record);
+                    handedOff = true;
                     if (numRecordsSendCounter != null) {
                         numRecordsSendCounter.inc();
                     }
@@ -310,12 +347,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                         }
                         numBytesSendCounter.inc(bytes);
                     }
-                } catch (Exception e) {
-                    inFlightSemaphore.release();
-                    if (numRecordsSendErrorsCounter != null) {
-                        numRecordsSendErrorsCounter.inc();
+                } finally {
+                    if (!handedOff) {
+                        inFlightSemaphore.release();
                     }
-                    throw new IOException("Failed to write to Redis", e);
                 }
             }
 
@@ -385,94 +420,165 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     }
 
     /**
-     * Sends a single record to Redis with retry logic and tracks the in-flight future.
+     * Sends a single record to Redis.
      *
      * <p>The backpressure permit acquired by {@link #acquireInFlightPermit()} in {@link
-     * #flushBuffer()} is owned by this send: it is released exactly once when the command finally
-     * completes (successfully or after all retries are exhausted). On a synchronous failure the
-     * permit is released by the caller ({@link #flushBuffer()}), which then propagates the error.
+     * #flushBuffer()} is handed over to a per-record completion promise created here. The promise
+     * completes (normally) exactly once, when the whole logical write has resolved — that is, after
+     * all bounded retries and any follow-up command (e.g. the actual SET/HSET issued for
+     * set.if.absent). The permit is released, and the promise removed from the in-flight set, only
+     * on that completion. Any terminal error is recorded in {@link #asyncError} (never propagated
+     * through the promise), so a transient-but-retried failure never aborts a checkpoint while a
+     * genuinely failed write still restarts the job via {@link #checkAsyncError()}.
+     *
+     * <p>This method never throws for command failures; they are routed to {@link #asyncError}.
      */
-    private void sendRecord(PendingRecord record) throws Exception {
-        submitWithRetry(record, this.maxRetryTimes);
+    private void sendRecord(PendingRecord record) {
+        final CompletableFuture<Void> completion = new CompletableFuture<>();
+        synchronized (inFlightCompletions) {
+            inFlightCompletions.add(completion);
+        }
+        completion.whenComplete(
+                (v, t) -> {
+                    synchronized (inFlightCompletions) {
+                        inFlightCompletions.remove(completion);
+                    }
+                    inFlightSemaphore.release();
+                });
+
+        try {
+            attempt(record, this.maxRetryTimes, completion);
+        } catch (Throwable t) {
+            // attempt() handles its own errors; this is a last-resort guard so the permit (owned by
+            // the completion promise) is never leaked on an unexpected failure.
+            recordAsyncFailure(keyOf(record), t);
+            completion.complete(null);
+        }
     }
 
     /**
-     * Issues the command for a record and, on failure, re-issues it up to {@code attemptsRemaining}
-     * more times before surfacing the error. Bounded async retry means a transient async failure
-     * (e.g. a brief connection blip or a command timeout) is retried instead of immediately failing
-     * the whole Flink job, while still preserving at-least-once semantics: once all retries are
-     * exhausted the error is recorded and later re-thrown from {@link #checkAsyncError()} so Flink
-     * can restart from the last checkpoint.
+     * Issues the write for a record and, on failure, re-issues the whole write up to {@code
+     * attemptsRemaining} more times before giving up. The shared {@code completion} promise stays
+     * pending across the entire retry chain and is completed exactly once when the write finally
+     * succeeds or all retries are exhausted. Bounded retry means a transient failure (a brief
+     * connection blip or a command timeout) is retried instead of immediately failing the whole
+     * Flink job, while at-least-once is preserved: once retries are exhausted the error is recorded
+     * and later re-thrown from {@link #checkAsyncError()} so Flink restarts from the last
+     * checkpoint.
      */
-    private void submitWithRetry(PendingRecord record, int attemptsRemaining) throws Exception {
-        RedisFuture redisFuture;
+    private void attempt(
+            PendingRecord record, int attemptsRemaining, CompletableFuture<Void> completion) {
+        CompletionStage<?> writeStage;
         try {
-            if (record.kind == RowKind.DELETE) {
-                redisFuture = rowKindDelete(record.params);
-            } else {
-                redisFuture = sink(record.params);
-            }
-        } catch (UnsupportedOperationException e) {
-            // Non-retryable configuration error; permit released by flushBuffer's handler.
-            throw e;
+            writeStage =
+                    record.kind == RowKind.DELETE
+                            ? rowKindDelete(record.params)
+                            : sink(record.params);
         } catch (Exception e) {
-            // Synchronous failure issuing the command.
-            if (attemptsRemaining > 0) {
+            // Synchronous failure issuing the command (e.g. connection already closed, or a
+            // non-retryable UnsupportedOperationException from an unsupported command).
+            if (attemptsRemaining > 0 && !(e instanceof UnsupportedOperationException)) {
                 LOG.warn(
                         "sink redis error when issuing command, remaining retries:{}",
                         attemptsRemaining,
                         e);
-                submitWithRetry(record, attemptsRemaining - 1);
-                return;
+                attempt(record, attemptsRemaining - 1, completion);
+            } else {
+                recordAsyncFailure(keyOf(record), e);
+                completion.complete(null);
             }
-            throw new RuntimeException("sink redis error ", e);
-        }
-
-        if (redisFuture == null) {
-            // No future returned, release permit immediately.
-            inFlightSemaphore.release();
             return;
         }
 
-        // Track the future for flush completion.
-        synchronized (inFlightFutures) {
-            inFlightFutures.add(redisFuture);
+        if (writeStage == null) {
+            // No command was issued (e.g. a no-op); nothing to wait for.
+            completion.complete(null);
+            return;
         }
 
-        final RedisFuture<?> trackedFuture = redisFuture;
-        redisFuture.whenComplete(
+        writeStage.whenComplete(
                 (r, t) -> {
-                    // Remove from tracked futures first.
-                    synchronized (inFlightFutures) {
-                        inFlightFutures.remove(trackedFuture);
-                    }
-
                     if (t == null) {
-                        // Success: set TTL and release the backpressure permit.
-                        setTtl(record.params[0]);
-                        inFlightSemaphore.release();
+                        // Write succeeded: now apply TTL as part of the same logical write. The
+                        // completion promise is resolved only after the TTL command finishes (or is
+                        // skipped), and a TTL failure is retried / surfaced just like a write
+                        // failure, so "written but not expired" data cannot slip past a checkpoint.
+                        attemptTtl(record, this.maxRetryTimes, completion);
                         return;
                     }
 
                     if (attemptsRemaining > 0) {
-                        // Transient async failure: re-issue instead of failing the whole job. The
-                        // permit is held across the retry (released by the new future's callback).
+                        // Transient async failure: re-issue the whole write. The permit stays held
+                        // (the promise remains pending) until the retry chain resolves.
                         LOG.warn(
                                 "Async Redis write failed for key: {}, retrying (remaining={})",
-                                record.params[0],
+                                keyOf(record),
                                 attemptsRemaining,
                                 (Throwable) t);
                         try {
-                            submitWithRetry(record, attemptsRemaining - 1);
-                        } catch (Exception e) {
-                            recordAsyncFailure(record.params[0], e);
-                            inFlightSemaphore.release();
+                            attempt(record, attemptsRemaining - 1, completion);
+                        } catch (Throwable e) {
+                            recordAsyncFailure(keyOf(record), e);
+                            completion.complete(null);
                         }
                     } else {
                         // Retries exhausted: record the error (surfaced by checkAsyncError) and
-                        // release the permit.
-                        recordAsyncFailure(record.params[0], (Throwable) t);
-                        inFlightSemaphore.release();
+                        // resolve the promise.
+                        recordAsyncFailure(keyOf(record), (Throwable) t);
+                        completion.complete(null);
+                    }
+                });
+    }
+
+    private static String keyOf(PendingRecord record) {
+        return record.params != null && record.params.length > 0 ? record.params[0] : "<unknown>";
+    }
+
+    /**
+     * Applies the TTL for a record and, on failure, retries only the TTL (not the whole write, so
+     * non-idempotent write commands are not re-applied) up to {@code attemptsRemaining} times. The
+     * shared {@code completion} promise is resolved only after the TTL command finishes or is
+     * skipped; a terminal TTL failure is recorded in {@link #asyncError}. This keeps TTL part of
+     * the per-record completion/retry/error tracking so a checkpoint cannot succeed with a written
+     * but not-yet-expired key.
+     */
+    private void attemptTtl(
+            PendingRecord record, int attemptsRemaining, CompletableFuture<Void> completion) {
+        final String key = keyOf(record);
+        CompletionStage<?> ttlStage;
+        try {
+            ttlStage = issueTtl(key);
+        } catch (Exception e) {
+            if (attemptsRemaining > 0) {
+                LOG.warn("set TTL failed for key: {}, retrying (remaining={})", key, attemptsRemaining, e);
+                attemptTtl(record, attemptsRemaining - 1, completion);
+            } else {
+                recordAsyncFailure(key, e);
+                completion.complete(null);
+            }
+            return;
+        }
+
+        if (ttlStage == null) {
+            // No TTL configured: the write is the whole logical operation.
+            completion.complete(null);
+            return;
+        }
+
+        ttlStage.whenComplete(
+                (r, t) -> {
+                    if (t == null) {
+                        completion.complete(null);
+                    } else if (attemptsRemaining > 0) {
+                        LOG.warn(
+                                "set TTL failed for key: {}, retrying (remaining={})",
+                                key,
+                                attemptsRemaining,
+                                (Throwable) t);
+                        attemptTtl(record, attemptsRemaining - 1, completion);
+                    } else {
+                        recordAsyncFailure(key, (Throwable) t);
+                        completion.complete(null);
                     }
                 });
     }
@@ -487,18 +593,60 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     }
 
     /**
-     * Waits for all currently in-flight futures to complete.
-     * Called during flush and close to ensure data consistency at checkpoint boundaries.
+     * Composes a conditional ("if absent") write: runs {@code existsCheck} and, only if {@code
+     * writeWhen} accepts its result, issues the actual {@code write}. The returned stage completes
+     * when the actual write completes (or immediately if the write is skipped), so the real write —
+     * not just the existence check — is covered by the sink's retry, flush and error tracking.
      */
-    private void waitForInFlightFutures() throws IOException {
-        List<RedisFuture<?>> snapshot;
-        synchronized (inFlightFutures) {
-            snapshot = new ArrayList<>(inFlightFutures);
+    private CompletionStage<Object> conditionalWrite(
+            RedisFuture<?> existsCheck,
+            Predicate<Object> writeWhen,
+            Supplier<RedisFuture<?>> write) {
+        CompletableFuture<Object> result = new CompletableFuture<>();
+        existsCheck.whenComplete(
+                (val, thr) -> {
+                    if (thr != null) {
+                        result.completeExceptionally(thr);
+                        return;
+                    }
+                    try {
+                        if (writeWhen.test(val)) {
+                            write.get()
+                                    .whenComplete(
+                                            (r, t) -> {
+                                                if (t != null) {
+                                                    result.completeExceptionally(t);
+                                                } else {
+                                                    result.complete(r);
+                                                }
+                                            });
+                        } else {
+                            // Key already present: nothing to write, treat as success.
+                            result.complete(null);
+                        }
+                    } catch (Throwable e) {
+                        result.completeExceptionally(e);
+                    }
+                });
+        return result;
+    }
+
+    /**
+     * Waits for all currently in-flight record completion promises to resolve.
+     * Called during flush and close to ensure data consistency at checkpoint boundaries. Promises
+     * resolve only after the whole write (including retries and follow-up commands) finishes, so
+     * waiting here never trips on an intermediate attempt that has already failed and is being
+     * retried.
+     */
+    private void waitForInFlightCompletions() throws IOException {
+        List<CompletableFuture<Void>> snapshot;
+        synchronized (inFlightCompletions) {
+            snapshot = new ArrayList<>(inFlightCompletions);
         }
 
-        for (RedisFuture<?> future : snapshot) {
+        for (CompletableFuture<Void> completion : snapshot) {
             try {
-                future.get(60, TimeUnit.SECONDS);
+                completion.get(flushWaitTimeoutMs, TimeUnit.MILLISECONDS);
             } catch (Exception e) {
                 throw new IOException("Error waiting for in-flight Redis operation to complete", e);
             }
@@ -516,8 +664,8 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         }
     }
 
-    private RedisFuture sink(String[] params) {
-        RedisFuture redisFuture = null;
+    private CompletionStage sink(String[] params) {
+        CompletionStage redisFuture = null;
         switch (redisCommand.getInsertCommand()) {
             case RPUSH:
                 redisFuture = this.redisCommandsContainer.rpush(params[0], params[1]);
@@ -532,13 +680,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 if (!this.setIfAbsent) {
                     redisFuture = this.redisCommandsContainer.set(params[0], params[1]);
                 } else {
-                    redisFuture = this.redisCommandsContainer.exists(params[0]);
-                    redisFuture.whenComplete(
-                            (existsVal, throwable) -> {
-                                if ((int) existsVal == 0) {
-                                    this.redisCommandsContainer.set(params[0], params[1]);
-                                }
-                            });
+                    // Cover the real SET (not just EXISTS) with retry/flush/error tracking by
+                    // completing only after the actual write finishes.
+                    redisFuture =
+                            conditionalWrite(
+                                    this.redisCommandsContainer.exists(params[0]),
+                                    val -> ((Number) val).intValue() == 0,
+                                    () -> this.redisCommandsContainer.set(params[0], params[1]));
                 }
             }
                 break;
@@ -597,14 +745,12 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                     redisFuture =
                             this.redisCommandsContainer.hset(params[0], params[1], params[2]);
                 } else {
-                    redisFuture = this.redisCommandsContainer.hexists(params[0], params[1]);
-                    redisFuture.whenComplete(
-                            (exist, throwable) -> {
-                                if (!(Boolean) exist) {
-                                    this.redisCommandsContainer.hset(
-                                            params[0], params[1], params[2]);
-                                }
-                            });
+                    redisFuture =
+                            conditionalWrite(
+                                    this.redisCommandsContainer.hexists(params[0], params[1]),
+                                    exist -> Boolean.FALSE.equals(exist),
+                                    () -> this.redisCommandsContainer.hset(
+                                            params[0], params[1], params[2]));
                 }
             }
                 break;
@@ -622,13 +768,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 if (!this.setIfAbsent) {
                     redisFuture = this.redisCommandsContainer.hmset(params[0], hashField);
                 } else {
-                    redisFuture = this.redisCommandsContainer.exists(params[0]);
-                    redisFuture.whenComplete(
-                            (exist, throwable) -> {
-                                if (!(Boolean) exist) {
-                                    this.redisCommandsContainer.hmset(params[0], hashField);
-                                }
-                            });
+                    // EXISTS returns Long (0/1); the previous code cast it to Boolean, which threw
+                    // ClassCastException at runtime. Use a numeric check and cover the real HMSET.
+                    redisFuture =
+                            conditionalWrite(
+                                    this.redisCommandsContainer.exists(params[0]),
+                                    val -> ((Number) val).intValue() == 0,
+                                    () -> this.redisCommandsContainer.hmset(params[0], hashField));
                 }
             }
                 break;
@@ -710,39 +856,69 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         return redisFuture;
     }
 
-    private void setTtl(String key) {
+    /**
+     * Issues the TTL command(s) for a key and returns a stage that completes when the actual EXPIRE
+     * finishes (or immediately when no EXPIRE is needed), or {@code null} when no TTL is configured.
+     * The returned stage lets the caller fold TTL into the record's completion/retry/error
+     * tracking instead of firing it and forgetting it.
+     */
+    private CompletionStage<?> issueTtl(String key) {
         if (redisCommand == RedisCommand.DEL) {
-            return;
+            return null;
         }
 
         if (ttl != null) {
             if (ttlKeyNotAbsent) {
-                this.redisCommandsContainer
-                        .getTTL(key)
-                        .whenComplete(
-                                (t, h) -> {
-                                    if (t < 0) {
-                                        this.redisCommandsContainer.expire(key, ttl);
-                                    }
-                                });
-            } else {
-                this.redisCommandsContainer.expire(key, ttl);
+                return expireIfNoTtl(key, () -> ttl);
             }
+            return this.redisCommandsContainer.expire(key, ttl);
         } else if (expireTimeSeconds != -1) {
-            this.redisCommandsContainer
-                    .getTTL(key)
-                    .whenComplete(
-                            (t, h) -> {
-                                if (t < 0) {
-                                    int now = LocalTime.now().toSecondOfDay();
-                                    this.redisCommandsContainer.expire(
-                                            key,
-                                            expireTimeSeconds > now
-                                                    ? expireTimeSeconds - now
-                                                    : 86400 + expireTimeSeconds - now);
-                                }
-                            });
+            return expireIfNoTtl(
+                    key,
+                    () -> {
+                        int now = LocalTime.now().toSecondOfDay();
+                        return expireTimeSeconds > now
+                                ? expireTimeSeconds - now
+                                : 86400 + expireTimeSeconds - now;
+                    });
         }
+        return null;
+    }
+
+    /**
+     * Sets an expiry on {@code key} only if it currently has no TTL. Returns a stage that completes
+     * after the EXPIRE (or immediately when the key already has a TTL / the check fails).
+     */
+    private CompletionStage<?> expireIfNoTtl(String key, Supplier<Integer> secondsSupplier) {
+        CompletableFuture<Object> result = new CompletableFuture<>();
+        this.redisCommandsContainer
+                .getTTL(key)
+                .whenComplete(
+                        (currentTtl, h) -> {
+                            if (h != null) {
+                                result.completeExceptionally(h);
+                                return;
+                            }
+                            try {
+                                if (currentTtl != null && currentTtl < 0) {
+                                    this.redisCommandsContainer
+                                            .expire(key, secondsSupplier.get())
+                                            .whenComplete(
+                                                    (r, e) -> {
+                                                        if (e != null) {
+                                                            result.completeExceptionally(e);
+                                                        } else {
+                                                            result.complete(r);
+                                                        }
+                                                    });
+                                } else {
+                                    result.complete(null);
+                                }
+                            } catch (Throwable e) {
+                                result.completeExceptionally(e);
+                            }
+                        });
+        return result;
     }
 
     private String serializeWholeRow(RowData rowData) {
