@@ -18,6 +18,7 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
+import org.apache.flink.api.common.operators.MailboxExecutor;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.connectors.redis.command.RedisCommand;
 import org.apache.flink.streaming.connectors.redis.config.FlinkSingleConfig;
@@ -32,6 +33,8 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.types.RowKind;
+import org.apache.flink.util.function.ThrowingRunnable;
 import org.junit.jupiter.api.Test;
 
 import io.lettuce.core.RedisException;
@@ -49,6 +52,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -192,8 +196,61 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
         }
     }
 
+    @Test
+    public void testFlushDoesNotYieldMailboxBeforeBatchRecordsAreIssued() throws Exception {
+        Configuration config = sinkConfig(0);
+        config.set(RedisOptions.SINK_BATCH_SIZE, 2);
+        config.set(RedisOptions.SINK_WRITE_QPS, 1000L);
+        config.set(RedisOptions.SINK_WRITE_QPS_BURST_SECONDS, 0.0D);
+
+        List<ManualRedisFuture<String>> setFutures = new ArrayList<>();
+        PrematureYieldMailboxExecutor mailboxExecutor =
+                new PrematureYieldMailboxExecutor(() -> setFutures.size() < 2);
+        RedisSinkWriter writer = createWriter(config, RedisCommand.SET, mailboxExecutor);
+        AtomicBoolean completeNewSetFutures = new AtomicBoolean(true);
+
+        try {
+            RedisCommandsContainer originalContainer =
+                    replaceCommandsContainer(
+                            writer, pendingSetContainer(setFutures, completeNewSetFutures));
+            originalContainer.close();
+
+            writer.write(record("mailbox-key-1", "value-1"), null);
+            writer.write(record("mailbox-key-2", "value-2"), null);
+
+            assertEquals(2, setFutures.size());
+            assertTrue(!mailboxExecutor.wasPrematureTryYieldCalled());
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    public void testUnsupportedDeleteCommandFailsInsteadOfNoOp() throws Exception {
+        Configuration config = sinkConfig(0);
+        config.set(RedisOptions.SINK_BATCH_SIZE, 1);
+        RedisSinkWriter writer = createWriter(config, RedisCommand.RPUSH, null);
+
+        try {
+            writer.write(record("unsupported-delete-key", "value", RowKind.DELETE), null);
+
+            IOException failure = assertThrows(IOException.class, () -> writer.flush(false));
+            assertEquals("Async Redis write failed", failure.getMessage());
+            assertTrue(failure.getCause() instanceof UnsupportedOperationException);
+            assertTrue(failure.getCause().getMessage().contains("no delete command"));
+        } finally {
+            writer.close();
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static RedisSinkWriter createWriter(Configuration config) {
+        return createWriter(config, RedisCommand.SET, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static RedisSinkWriter createWriter(
+            Configuration config, RedisCommand redisCommand, MailboxExecutor mailboxExecutor) {
         FlinkSingleConfig flinkConfig =
                 new FlinkSingleConfig.Builder()
                         .setHost(REDIS_HOST)
@@ -204,9 +261,10 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
                         .setLettuceConfig(new LettuceConfig(null, null, 1000))
                         .build();
         RedisSinkMapper<RowData> mapper =
-                (RedisSinkMapper<RowData>) (RedisSinkMapper<?>) new RowRedisSinkMapper(RedisCommand.SET, config);
+                (RedisSinkMapper<RowData>) (RedisSinkMapper<?>) new RowRedisSinkMapper(redisCommand, config);
         List<DataType> columnDataTypes = Arrays.asList(DataTypes.STRING(), DataTypes.STRING());
-        return new RedisSinkWriter(flinkConfig, mapper, columnDataTypes, config, null, 1, null);
+        return new RedisSinkWriter(
+                flinkConfig, mapper, columnDataTypes, config, null, 1, mailboxExecutor);
     }
 
     private static Configuration sinkConfig(int maxRetries) {
@@ -218,7 +276,58 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
     }
 
     private static RowData record(String key, String value) {
-        return GenericRowData.of(StringData.fromString(key), StringData.fromString(value));
+        return record(key, value, RowKind.INSERT);
+    }
+
+    private static RowData record(String key, String value, RowKind rowKind) {
+        GenericRowData row =
+                GenericRowData.of(StringData.fromString(key), StringData.fromString(value));
+        row.setRowKind(rowKind);
+        return row;
+    }
+
+    private static final class PrematureYieldMailboxExecutor implements MailboxExecutor {
+
+        private final BooleanSupplier prematureYield;
+        private final AtomicBoolean prematureTryYieldCalled = new AtomicBoolean(false);
+
+        private PrematureYieldMailboxExecutor(BooleanSupplier prematureYield) {
+            this.prematureYield = prematureYield;
+        }
+
+        @Override
+        public void execute(
+                MailOptions mailOptions,
+                ThrowingRunnable<? extends Exception> command,
+                String descriptionFormat,
+                Object... descriptionArgs) {
+        }
+
+        @Override
+        public void yield() {
+            recordYield();
+        }
+
+        @Override
+        public boolean tryYield() {
+            recordYield();
+            return false;
+        }
+
+        @Override
+        public boolean shouldInterrupt() {
+            return false;
+        }
+
+        private void recordYield() {
+            if (prematureYield.getAsBoolean()) {
+                prematureTryYieldCalled.set(true);
+            }
+        }
+
+        private boolean wasPrematureTryYieldCalled() {
+            return prematureTryYieldCalled.get();
+        }
     }
 
     private static RedisCommandsContainer replaceCommandsContainer(

@@ -17,7 +17,11 @@
 
 因bahir使用的flink接口版本较老，所以改动较大，开发过程中参考了腾讯云与阿里云两家产商的流计算产品，取两家之长，并增加了更丰富的功能。
 
-注：redis不支持两段提交无法实现刚好一次语义。
+注：Redis 不支持两段提交，本 connector 的 Sink V2 writer 无 committer/state，
+无法实现 exactly-once。checkpoint 时会 flush 缓冲并等待所有异步写入完成，
+写入失败会让 checkpoint 失败并由 Flink 重放，因此 sink 侧提供 at-least-once 语义。
+SET/HSET/HMSET 等幂等写入重放后结果稳定；INCRBY、ZINCRBY、LPUSH/RPUSH、PFADD
+等非幂等命令在重试或 checkpoint 重放时可能重复累加/追加。
 
 
 
@@ -163,7 +167,7 @@ create table sink_redis(name VARCHAR, subject VARCHAR, score VARCHAR)  with ('co
 
 2. **限速会产生反压，这是预期行为。** 被限速的 sink 是作业的人为瓶颈，Flink UI 中该 sink 的 `busy` 会接近 100%，上游（含 Source）会被反压而呈现"读一批—停—再读一批"的脉冲式消费。这说明限速生效了，不是故障。
 
-3. **等待令牌时不会冻结 task 线程。** 限速器与背压（`sink.max-in-flight-requests`）的等待都改成了协作式：等待期间会让出 Flink 的 mailbox 线程去处理其他邮件，并以毫秒级切片轮询，因此不会像 `Thread.sleep` 那样把主线程整段占死。
+3. **等待令牌和 in-flight 槽位时按短切片轮询。** 限速器与背压（`sink.max-in-flight-requests`）等待使用毫秒级切片，避免长时间 `Thread.sleep`。为了保证 checkpoint 语义，当前 batch 尚未全部发出前不会让出 Flink mailbox，避免 checkpoint flush 重入时跳过未发送记录。
 
 4. **务必开启非对齐 checkpoint。** 限速带来的反压会让 checkpoint barrier 被网络缓冲区里堆积的数据挡住，导致对齐式 checkpoint 长时间无法完成。开启非对齐 checkpoint 可让 barrier 越过堆积数据：
 

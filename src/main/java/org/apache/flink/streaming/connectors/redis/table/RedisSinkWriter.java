@@ -112,7 +112,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final int numParallelSubtasks;
     private transient TokenBucketRateLimiter rateLimiter;
 
-    // --- Cooperative waiting (do not freeze the Flink task/mailbox thread) ---
+    // --- Short-slice waiting ---
     private final transient MailboxExecutor mailboxExecutor;
     private static final long MAX_PARK_NANOS = 1_000_000L; // 1ms slices while waiting
     private static final long RETRY_BACKOFF_BASE_MS = 100L;
@@ -348,8 +348,8 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         try {
             for (PendingRecord record : batchBuffer) {
                 // Rate limiting: throttle the rate at which commands are issued to Redis (write
-                // QPS). Wait cooperatively so the task/mailbox thread stays responsive to
-                // checkpoint barriers instead of being frozen in Thread.sleep.
+                // QPS). Wait in short slices so async Redis completion threads can release
+                // in-flight permits promptly.
                 if (rateLimiter != null) {
                     cooperativeWait(rateLimiter.reserve(1));
                 }
@@ -358,8 +358,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 // the just-acquired permit before it is handed off to the completion promise.
                 checkAsyncError();
 
-                // Backpressure: acquire a permit, again yielding to the mailbox while waiting so a
-                // slow Redis does not freeze the task thread for the whole timeout.
+                // Backpressure: acquire a permit before sending the record.
                 acquireInFlightPermit();
 
                 // Ownership of the acquired permit is handed to the per-record completion promise
@@ -398,9 +397,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     }
 
     /**
-     * Cooperatively waits for the given number of nanoseconds, yielding to the Flink mailbox so
-     * that checkpoint-related mail and async completion callbacks keep being processed instead of
-     * freezing the task thread inside {@code Thread.sleep}.
+     * Waits for the given number of nanoseconds in short slices.
+     *
+     * <p>Do not yield the Flink mailbox while a batch is being flushed. Checkpoint mail could
+     * re-enter {@link #flush(boolean)} before all records in the current batch have been issued and
+     * registered in {@link #inFlightCompletions}, allowing the checkpoint to complete without those
+     * records. Redis async callbacks complete on their own threads, so permit release does not
+     * depend on mailbox execution.
      */
     private void cooperativeWait(long waitNanos) throws InterruptedException {
         if (waitNanos <= 0) {
@@ -409,13 +412,14 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         long deadline = System.nanoTime() + waitNanos;
         long remaining;
         while ((remaining = deadline - System.nanoTime()) > 0) {
-            if (!tryYieldMailbox()) {
-                LockSupport.parkNanos(Math.min(remaining, MAX_PARK_NANOS));
+            if (!flushing && tryYieldMailbox()) {
+                continue;
             }
+            LockSupport.parkNanos(Math.min(remaining, MAX_PARK_NANOS));
         }
     }
 
-    /** Acquires a backpressure permit, yielding to the mailbox while waiting. */
+    /** Acquires a backpressure permit. */
     private void acquireInFlightPermit() throws IOException, InterruptedException {
         if (inFlightSemaphore.tryAcquire()) {
             return;
@@ -435,9 +439,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             }
             // Surface async failures promptly while waiting.
             checkAsyncError();
-            if (!tryYieldMailbox()) {
-                LockSupport.parkNanos(MAX_PARK_NANOS);
+            if (!flushing && tryYieldMailbox()) {
+                continue;
             }
+            LockSupport.parkNanos(MAX_PARK_NANOS);
         }
     }
 
@@ -1040,6 +1045,12 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 redisFuture =
                         commandsContainer.incrByFloat(params[0], -Double.valueOf(params[1]));
                 break;
+            case NONE:
+            default:
+                throw new UnsupportedOperationException(
+                        "Cannot process DELETE row for Redis command "
+                                + redisCommand
+                                + " because no delete command is defined.");
         }
         return redisFuture;
     }
