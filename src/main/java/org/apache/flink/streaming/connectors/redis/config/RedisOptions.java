@@ -268,6 +268,15 @@ public class RedisOptions {
                             "The maximum number of async requests that can be in flight at the same time. "
                                     + "This provides backpressure when Redis is slow.");
 
+    public static final ConfigOption<Long> SINK_MAX_IN_FLIGHT_ACQUIRE_TIMEOUT =
+            ConfigOptions.key("sink.max-in-flight-acquire-timeout")
+                    .longType()
+                    .defaultValue(0L)
+                    .withDescription(
+                            "Maximum time in milliseconds to wait for an in-flight request slot. "
+                                    + "A value <= 0 means wait indefinitely and apply backpressure "
+                                    + "instead of failing the task.");
+
     private RedisOptions() {
     }
 }

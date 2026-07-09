@@ -115,9 +115,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     // --- Cooperative waiting (do not freeze the Flink task/mailbox thread) ---
     private final transient MailboxExecutor mailboxExecutor;
     private static final long MAX_PARK_NANOS = 1_000_000L; // 1ms slices while waiting
-    private static final long IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS = 60_000_000_000L; // 60s
     private static final long RETRY_BACKOFF_BASE_MS = 100L;
     private static final long RETRY_BACKOFF_MAX_MS = 2_000L;
+    private final long maxInFlightAcquireTimeoutMs;
     private transient boolean flushing;
 
     // --- Async error tracking ---
@@ -184,6 +184,8 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         this.batchSize = readableConfig.get(RedisOptions.SINK_BATCH_SIZE);
         this.batchFlushIntervalMs = readableConfig.get(RedisOptions.SINK_BATCH_FLUSH_INTERVAL);
         this.maxInFlightRequests = readableConfig.get(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS);
+        this.maxInFlightAcquireTimeoutMs =
+                readableConfig.get(RedisOptions.SINK_MAX_IN_FLIGHT_ACQUIRE_TIMEOUT);
 
         // Write QPS rate-limiting configuration (total across all subtasks)
         this.writeQps = readableConfig.get(RedisOptions.SINK_WRITE_QPS);
@@ -413,21 +415,23 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         }
     }
 
-    /**
-     * Acquires a backpressure permit, yielding to the mailbox while waiting so a slow Redis does
-     * not freeze the task thread. Times out after {@link #IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS}.
-     */
+    /** Acquires a backpressure permit, yielding to the mailbox while waiting. */
     private void acquireInFlightPermit() throws IOException, InterruptedException {
         if (inFlightSemaphore.tryAcquire()) {
             return;
         }
-        long deadline = System.nanoTime() + IN_FLIGHT_ACQUIRE_TIMEOUT_NANOS;
+        long deadline =
+                maxInFlightAcquireTimeoutMs > 0
+                        ? System.nanoTime()
+                                + TimeUnit.MILLISECONDS.toNanos(maxInFlightAcquireTimeoutMs)
+                        : Long.MAX_VALUE;
         while (!inFlightSemaphore.tryAcquire()) {
-            if (System.nanoTime() > deadline) {
+            if (maxInFlightAcquireTimeoutMs > 0 && System.nanoTime() > deadline) {
                 throw new IOException(
                         "Timeout waiting for available slot to send Redis command. "
                                 + "Redis may be overloaded. Consider increasing sink.max-in-flight-requests "
-                                + "or reducing throughput.");
+                                + "or reducing throughput. To wait indefinitely, set "
+                                + "sink.max-in-flight-acquire-timeout to 0.");
             }
             // Surface async failures promptly while waiting.
             checkAsyncError();

@@ -151,6 +151,7 @@ create table sink_redis(name VARCHAR, subject VARCHAR, score VARCHAR)  with ('co
 | sink.batch.size            | 100     | Integer | 缓冲多少条记录后批量写入Redis，设为1则禁用批量（逐条写入）                        |
 | sink.batch.flush-interval  | 1000    | Long    | 最大缓冲时间(毫秒)，即使未达到batch.size也会触发写入                          |
 | sink.max-in-flight-requests| 1000    | Integer | 最大异步在途请求数，用于背压控制，Redis响应慢时自动限速                            |
+| sink.max-in-flight-acquire-timeout | 0 | Long | 等待异步在途请求槽位的最长时间(毫秒)。<=0 表示一直等待并产生背压；>0 表示超过该时间后失败 |
 | sink.write.qps             | 0       | Long    | 整个sink（所有并行子任务合计）的最大写入QPS（每秒发往Redis的命令数）。运行时按并行度均分到各子任务（每子任务QPS=总QPS/并行度）。<=0 表示不限速 |
 | sink.write.qps.burst-seconds| 1.0    | Double  | 令牌桶允许累积的突发容量(秒)。值越大越能容忍批量突发，值越小限速越平滑。仅当 sink.write.qps>0 时生效 |
 

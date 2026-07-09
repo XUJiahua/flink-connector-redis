@@ -44,9 +44,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -113,6 +115,83 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
         }
     }
 
+    @Test
+    public void testBackpressureWaitsForInFlightSlotByDefault() throws Exception {
+        Configuration config = sinkConfig(0);
+        config.set(RedisOptions.SINK_BATCH_SIZE, 2);
+        config.set(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS, 1);
+        RedisSinkWriter writer = createWriter(config);
+        List<ManualRedisFuture<String>> setFutures = new CopyOnWriteArrayList<>();
+        AtomicBoolean completeNewSetFutures = new AtomicBoolean(false);
+
+        try {
+            RedisCommandsContainer originalContainer =
+                    replaceCommandsContainer(
+                            writer, pendingSetContainer(setFutures, completeNewSetFutures));
+            originalContainer.close();
+
+            writer.write(record("backpressure-key-1", "value-1"), null);
+            CompletableFuture<Void> secondWrite =
+                    CompletableFuture.runAsync(
+                            () -> {
+                                try {
+                                    writer.write(record("backpressure-key-2", "value-2"), null);
+                                } catch (Exception e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
+
+            waitUntilFutureCount(setFutures, 1);
+            assertTrue(!secondWrite.isDone());
+
+            setFutures.get(0).complete("OK");
+            waitUntilFutureCount(setFutures, 2);
+            secondWrite.get(5, TimeUnit.SECONDS);
+
+            setFutures.get(1).complete("OK");
+            writer.flush(false);
+        } finally {
+            completeNewSetFutures.set(true);
+            for (ManualRedisFuture<String> future : setFutures) {
+                future.complete("OK");
+            }
+            writer.close();
+        }
+    }
+
+    @Test
+    public void testConfiguredInFlightAcquireTimeoutStillFailsFast() throws Exception {
+        Configuration config = sinkConfig(0);
+        config.set(RedisOptions.SINK_BATCH_SIZE, 1);
+        config.set(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS, 1);
+        config.set(RedisOptions.SINK_MAX_IN_FLIGHT_ACQUIRE_TIMEOUT, 50L);
+        RedisSinkWriter writer = createWriter(config);
+
+        List<ManualRedisFuture<String>> setFutures = new ArrayList<>();
+        AtomicBoolean completeNewSetFutures = new AtomicBoolean(false);
+        try {
+            RedisCommandsContainer originalContainer =
+                    replaceCommandsContainer(
+                            writer, pendingSetContainer(setFutures, completeNewSetFutures));
+            originalContainer.close();
+
+            writer.write(record("timeout-key-1", "value-1"), null);
+            assertEquals(1, setFutures.size());
+
+            IOException failure =
+                    assertThrows(
+                            IOException.class,
+                            () -> writer.write(record("timeout-key-2", "value-2"), null));
+            assertTrue(failure.getMessage().contains("Timeout waiting for available slot"));
+        } finally {
+            completeNewSetFutures.set(true);
+            for (ManualRedisFuture<String> future : setFutures) {
+                future.complete("OK");
+            }
+            writer.close();
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static RedisSinkWriter createWriter(Configuration config) {
         FlinkSingleConfig flinkConfig =
@@ -153,6 +232,11 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
 
     private static RedisCommandsContainer pendingSetContainer(
             List<ManualRedisFuture<String>> setFutures) {
+        return pendingSetContainer(setFutures, new AtomicBoolean(false));
+    }
+
+    private static RedisCommandsContainer pendingSetContainer(
+            List<ManualRedisFuture<String>> setFutures, AtomicBoolean completeNewSetFutures) {
         return (RedisCommandsContainer) Proxy.newProxyInstance(
                 RedisCommandsContainer.class.getClassLoader(),
                 new Class<?>[]{RedisCommandsContainer.class},
@@ -164,6 +248,9 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
                         case "set":
                             ManualRedisFuture<String> future = new ManualRedisFuture<>();
                             setFutures.add(future);
+                            if (completeNewSetFutures.get()) {
+                                future.complete("OK");
+                            }
                             return future;
                         case "toString":
                             return "PendingSetRedisCommandsContainer";
@@ -176,6 +263,22 @@ public class RedisSinkWriterConnectionClosedTest extends TestRedisConfigBase {
                                     "Unexpected Redis command: " + method.getName());
                     }
                 });
+    }
+
+    private static void waitUntilFutureCount(
+            List<ManualRedisFuture<String>> setFutures, int expectedCount)
+            throws InterruptedException, TimeoutException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (setFutures.size() < expectedCount) {
+            if (System.nanoTime() > deadline) {
+                throw new TimeoutException(
+                        "Expected "
+                                + expectedCount
+                                + " Redis futures but got "
+                                + setFutures.size());
+            }
+            Thread.sleep(10L);
+        }
     }
 
     private static final class ManualRedisFuture<T> extends CompletableFuture<T>
