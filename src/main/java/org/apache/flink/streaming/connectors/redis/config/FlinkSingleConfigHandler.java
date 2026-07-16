@@ -41,6 +41,7 @@ public class FlinkSingleConfigHandler implements FlinkConfigHandler {
         FlinkSingleConfig.Builder builder =
                 new FlinkSingleConfig.Builder()
                         .setHost(host)
+                        .setUsername(config.get(RedisOptions.USERNAME))
                         .setPassword(config.get(RedisOptions.PASSWORD))
                         .setLettuceConfig(lettuceConfig);
         builder.setPort(config.get(RedisOptions.PORT));

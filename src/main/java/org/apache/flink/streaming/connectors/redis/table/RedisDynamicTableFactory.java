@@ -88,6 +88,7 @@ public class RedisDynamicTableFactory
         options.add(RedisOptions.MAXIDLE);
         options.add(RedisOptions.MAXTOTAL);
         options.add(RedisOptions.CLUSTERNODES);
+        options.add(RedisOptions.USERNAME);
         options.add(RedisOptions.PASSWORD);
         options.add(RedisOptions.TIMEOUT);
         options.add(RedisOptions.COMMAND_TIMEOUT);

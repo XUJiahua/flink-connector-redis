@@ -72,6 +72,7 @@ on j.name = 'test'
 | connector             | (none) | String  | `redis`                                                                                          |
 | host                  | (none) | String  | Redis IP                                                                                         |
 | port                  | 6379   | Integer | Redis 端口                                                                                         |
+| username              | null   | String  | ACL 用户名，仅 Redis 6.0+ 开启 ACL 时生效；不设置则以 default 用户认证（等价旧版 requirepass）                              |
 | password              | null   | String  | 如果没有设置，则为 null                                                                                   |
 | database              | 0      | Integer | 默认使用 db0                                                                                         |
 | timeout               | 2000   | Integer | 连接超时时间，单位 ms，默认 1s                                                                               |

@@ -55,10 +55,11 @@ public class FlinkSentinelConfig extends FlinkConfigBase {
             int connectionTimeout,
             int soTimeout,
             int database,
+            String username,
             String password,
             String sentinelsPassword,
             LettuceConfig lettuceConfig) {
-        super(connectionTimeout, password, lettuceConfig);
+        super(connectionTimeout, username, password, lettuceConfig);
         Objects.requireNonNull(masterName, "Master name should be presented");
         Objects.requireNonNull(sentinelsInfo, "Sentinels information should be presented");
         this.masterName = masterName;
@@ -111,6 +112,7 @@ public class FlinkSentinelConfig extends FlinkConfigBase {
         private int connectionTimeout;
         private int soTimeout;
         private int database;
+        private String username;
         private String password;
         private String sentinelsPassword;
 
@@ -165,6 +167,11 @@ public class FlinkSentinelConfig extends FlinkConfigBase {
             return this;
         }
 
+        public Builder setUsername(String username) {
+            this.username = username;
+            return this;
+        }
+
         public Builder setPassword(String password) {
             this.password = password;
             return this;
@@ -192,6 +199,7 @@ public class FlinkSentinelConfig extends FlinkConfigBase {
                     connectionTimeout,
                     soTimeout,
                     database,
+                    username,
                     password,
                     sentinelsPassword,
                     lettuceConfig);

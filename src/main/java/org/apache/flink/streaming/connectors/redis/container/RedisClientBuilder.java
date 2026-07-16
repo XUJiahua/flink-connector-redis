@@ -99,9 +99,7 @@ public class RedisClientBuilder {
         if (singleConfig.getConnectionTimeout() > 0) {
             builder.withTimeout(Duration.ofMillis(singleConfig.getConnectionTimeout()));
         }
-        if (!StringUtils.isNullOrWhitespaceOnly(singleConfig.getPassword())) {
-            builder.withPassword(singleConfig.getPassword().toCharArray());
-        }
+        applyAuthentication(builder, singleConfig.getUsername(), singleConfig.getPassword());
 
         RedisClient redisClient = RedisClient.create(clientResources, builder.build());
         redisClient.setOptions(buildClientOptions(singleConfig));
@@ -133,11 +131,10 @@ public class RedisClientBuilder {
                                                 Duration.ofMillis(
                                                         clusterConfig.getConnectionTimeout()));
                                     }
-                                    if (!StringUtils.isNullOrWhitespaceOnly(
-                                            clusterConfig.getPassword())) {
-                                        builder.withPassword(
-                                                clusterConfig.getPassword().toCharArray());
-                                    }
+                                    applyAuthentication(
+                                            builder,
+                                            clusterConfig.getUsername(),
+                                            clusterConfig.getPassword());
                                     return builder.build();
                                 })
                         .collect(Collectors.toList());
@@ -181,23 +178,36 @@ public class RedisClientBuilder {
                 .forEach(
                         node -> {
                             String[] redis = node.split(":");
-                            if (StringUtils.isNullOrWhitespaceOnly(sentinelConfig.getPassword())) {
-                                builder.withSentinel(
-                                        redis[0],
-                                        Integer.parseInt(redis[1]),
-                                        sentinelConfig.getSentinelsPassword());
-                            } else {
-                                builder.withSentinel(
-                                        redis[0],
-                                        Integer.parseInt(redis[1]),
-                                        sentinelConfig.getSentinelsPassword())
-                                        .withPassword(sentinelConfig.getPassword().toCharArray());
-                            }
+                            builder.withSentinel(
+                                    redis[0],
+                                    Integer.parseInt(redis[1]),
+                                    sentinelConfig.getSentinelsPassword());
                         });
+
+        // Authentication against the master/replica data nodes (Redis 6.0+ ACL supports username).
+        applyAuthentication(builder, sentinelConfig.getUsername(), sentinelConfig.getPassword());
 
         RedisClient redisClient = RedisClient.create(clientResources, builder.build());
         redisClient.setOptions(buildClientOptions(sentinelConfig));
         return redisClient;
+    }
+
+    /**
+     * Applies authentication to a {@link RedisURI.Builder}. When a username is provided (Redis 6.0+
+     * with ACL enabled) it uses {@code withAuthentication(username, password)}, otherwise it falls
+     * back to the legacy password-only {@code withPassword(...)} which authenticates as the default
+     * user. When neither username nor password is set, no authentication is applied.
+     */
+    static void applyAuthentication(
+            RedisURI.Builder builder, String username, String password) {
+        boolean hasPassword = !StringUtils.isNullOrWhitespaceOnly(password);
+        if (!StringUtils.isNullOrWhitespaceOnly(username)) {
+            // Lettuce requires a (possibly empty) password when authenticating with a username.
+            char[] passwordChars = hasPassword ? password.toCharArray() : new char[0];
+            builder.withAuthentication(username, passwordChars);
+        } else if (hasPassword) {
+            builder.withPassword(password.toCharArray());
+        }
     }
 
     /**

@@ -41,8 +41,12 @@ public class FlinkClusterConfig extends FlinkConfigBase {
      * @throws NullPointerException if parameter {@code nodes} is {@code null}
      */
     private FlinkClusterConfig(
-            String nodesInfo, int connectionTimeout, String password, LettuceConfig lettuceConfig) {
-        super(connectionTimeout, password, lettuceConfig);
+            String nodesInfo,
+            int connectionTimeout,
+            String username,
+            String password,
+            LettuceConfig lettuceConfig) {
+        super(connectionTimeout, username, password, lettuceConfig);
 
         Objects.requireNonNull(nodesInfo, "nodesInfo information should be presented");
         this.nodesInfo = nodesInfo;
@@ -53,6 +57,7 @@ public class FlinkClusterConfig extends FlinkConfigBase {
 
         private String nodesInfo;
         private int timeout;
+        private String username;
         private String password;
 
         private LettuceConfig lettuceConfig;
@@ -73,6 +78,11 @@ public class FlinkClusterConfig extends FlinkConfigBase {
             return this;
         }
 
+        public Builder setUsername(String username) {
+            this.username = username;
+            return this;
+        }
+
         public Builder setPassword(String password) {
             this.password = password;
             return this;
@@ -89,7 +99,8 @@ public class FlinkClusterConfig extends FlinkConfigBase {
          * @return ClusterConfig
          */
         public FlinkClusterConfig build() {
-            return new FlinkClusterConfig(nodesInfo, timeout, password, lettuceConfig);
+            return new FlinkClusterConfig(
+                    nodesInfo, timeout, username, password, lettuceConfig);
         }
     }
 }

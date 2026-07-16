@@ -56,6 +56,14 @@ public class RedisOptions {
                     .intType()
                     .defaultValue(1)
                     .withDescription("Optional minIdle for connect to redis");
+    public static final ConfigOption<String> USERNAME =
+            ConfigOptions.key("username")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Optional username for connect to redis. Only takes effect on Redis "
+                                    + "6.0+ with ACL enabled. Leave it unset to authenticate as the "
+                                    + "default user (equivalent to the legacy requirepass behavior).");
     public static final ConfigOption<String> PASSWORD =
             ConfigOptions.key("password")
                     .stringType()

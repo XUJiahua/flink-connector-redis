@@ -43,10 +43,11 @@ public class FlinkSingleConfig extends FlinkConfigBase {
             String host,
             int port,
             int connectionTimeout,
+            String username,
             String password,
             int database,
             LettuceConfig lettuceConfig) {
-        super(connectionTimeout, password, lettuceConfig);
+        super(connectionTimeout, username, password, lettuceConfig);
         Objects.requireNonNull(host, "Host information should be presented");
         this.host = host;
         this.port = port;
@@ -87,6 +88,7 @@ public class FlinkSingleConfig extends FlinkConfigBase {
         private int port;
         private int timeout;
         private int database;
+        private String username;
         private String password;
 
         private LettuceConfig lettuceConfig;
@@ -136,6 +138,17 @@ public class FlinkSingleConfig extends FlinkConfigBase {
         }
 
         /**
+         * Sets username.
+         *
+         * @param username username, if any (Redis 6.0+ ACL)
+         * @return Builder itself
+         */
+        public Builder setUsername(String username) {
+            this.username = username;
+            return this;
+        }
+
+        /**
          * Sets password.
          *
          * @param password password, if any
@@ -157,7 +170,8 @@ public class FlinkSingleConfig extends FlinkConfigBase {
          * @return PoolConfig
          */
         public FlinkSingleConfig build() {
-            return new FlinkSingleConfig(host, port, timeout, password, database, lettuceConfig);
+            return new FlinkSingleConfig(
+                    host, port, timeout, username, password, database, lettuceConfig);
         }
     }
 }
