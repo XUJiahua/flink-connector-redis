@@ -29,6 +29,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Minimal RESP server on an ephemeral loopback port. It only exists so that {@link
@@ -38,6 +40,7 @@ import java.util.Locale;
  */
 final class FakeRespServer implements AutoCloseable {
 
+    private final CountDownLatch hsetReceived = new CountDownLatch(1);
     private final ServerSocket serverSocket;
     private final List<Socket> sockets = new ArrayList<>();
     private final Thread acceptor;
@@ -69,7 +72,11 @@ final class FakeRespServer implements AutoCloseable {
         }
     }
 
-    private static void serve(Socket s) {
+    boolean awaitHset(long timeoutSeconds) throws InterruptedException {
+        return hsetReceived.await(timeoutSeconds, TimeUnit.SECONDS);
+    }
+
+    private void serve(Socket s) {
         try (InputStream in = new BufferedInputStream(s.getInputStream());
                 OutputStream out = s.getOutputStream()) {
             while (true) {
@@ -83,6 +90,9 @@ final class FakeRespServer implements AutoCloseable {
                     reply = "-ERR unknown command 'HELLO'\r\n";
                 } else if ("PING".equals(name)) {
                     reply = "+PONG\r\n";
+                } else if ("HSET".equals(name)) {
+                    hsetReceived.countDown();
+                    reply = ":1\r\n";
                 } else {
                     reply = "+OK\r\n";
                 }

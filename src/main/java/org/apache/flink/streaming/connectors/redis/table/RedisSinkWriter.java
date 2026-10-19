@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.connectors.redis.table;
 
 import org.apache.flink.api.common.operators.MailboxExecutor;
+import org.apache.flink.api.common.operators.ProcessingTimeService;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.metrics.Counter;
@@ -54,6 +55,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -88,7 +91,12 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private final int batchSize;
     private final long batchFlushIntervalMs;
     private transient List<PendingRecord> batchBuffer;
-    private transient long lastFlushTimeMs;
+    private transient long firstBufferedAtMs;
+    private transient volatile long firstBufferedAtNanos;
+    private transient ProcessingTimeService processingTimeService;
+    private transient ScheduledFuture<?> flushTimer;
+    private transient long timerGeneration;
+    private transient volatile boolean closed;
 
     // --- Backpressure fields ---
     private final int maxInFlightRequests;
@@ -117,6 +125,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
         final String[] params;
         final RowKind kind;
+        final long bufferedAtNanos;
         // System.nanoTime() on entry to write(); 0 when latency metrics are off
         final long invokeNanos;
         // window-time reference (epoch ms), RedisSinkLatencyMetrics.NO_EVENT_TIME when absent
@@ -125,11 +134,32 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         PendingRecord(String[] params, RowKind kind, long invokeNanos, long eventTimeMs) {
             this.params = params;
             this.kind = kind;
+            this.bufferedAtNanos = System.nanoTime();
             this.invokeNanos = invokeNanos;
             this.eventTimeMs = eventTimeMs;
         }
     }
 
+    /** Creates a writer with autonomous flushing using Flink's mailbox-backed timer service. */
+    public RedisSinkWriter(
+            FlinkConfigBase flinkConfigBase,
+            RedisSinkMapper<RowData> redisSinkMapper,
+            List<DataType> columnDataTypes,
+            ReadableConfig readableConfig,
+            SinkWriterMetricGroup metricGroup,
+            int numParallelSubtasks,
+            MailboxExecutor mailboxExecutor,
+            ProcessingTimeService processingTimeService) {
+        this(flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
+                metricGroup, numParallelSubtasks, mailboxExecutor);
+        this.processingTimeService = processingTimeService;
+    }
+
+    /**
+     * Legacy constructor without autonomous timers. Use the overload taking a processing-time
+     * service for idle-input flushing. Without one, interval checks occur only on write.
+     */
+    @Deprecated
     public RedisSinkWriter(
             FlinkConfigBase flinkConfigBase,
             RedisSinkMapper<RowData> redisSinkMapper,
@@ -167,6 +197,11 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         this.batchSize = readableConfig.get(RedisOptions.SINK_BATCH_SIZE);
         this.batchFlushIntervalMs = readableConfig.get(RedisOptions.SINK_BATCH_FLUSH_INTERVAL);
         this.maxInFlightRequests = readableConfig.get(RedisOptions.SINK_MAX_IN_FLIGHT_REQUESTS);
+        Preconditions.checkArgument(batchSize > 0, "sink.batch.size must be positive");
+        Preconditions.checkArgument(batchFlushIntervalMs >= 0,
+                "sink.batch.flush-interval must not be negative");
+        Preconditions.checkArgument(maxInFlightRequests > 0,
+                "sink.max-in-flight-requests must be positive");
 
         // Write QPS rate-limiting configuration (total across all subtasks)
         this.writeQps = readableConfig.get(RedisOptions.SINK_WRITE_QPS);
@@ -179,6 +214,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             this.numRecordsSendErrorsCounter = metricGroup.getNumRecordsSendErrorsCounter();
             this.numBytesSendCounter = metricGroup.getNumBytesSendCounter();
             this.latencyMetrics = RedisSinkLatencyMetrics.tryRegister(metricGroup);
+            metricGroup.gauge("redis_sink_oldest_buffer_age_ms", () -> {
+                long started = firstBufferedAtNanos;
+                return started == 0L ? 0L : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            });
         }
 
         // Initialize Redis connection
@@ -198,7 +237,6 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
         // Initialize batching and backpressure state
         this.batchBuffer = new ArrayList<>(batchSize);
-        this.lastFlushTimeMs = System.currentTimeMillis();
         this.inFlightSemaphore = new Semaphore(maxInFlightRequests);
         this.asyncError = new AtomicReference<>(null);
         this.inFlightFutures = new ArrayList<>();
@@ -221,6 +259,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     @Override
     public void write(RowData rowData, Context context)
             throws IOException, InterruptedException {
+        if (closed) {
+            throw new IOException("Redis sink writer is closed");
+        }
         // Check for async errors from previous writes
         checkAsyncError();
 
@@ -251,7 +292,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         }
 
         // Buffer the record
+        boolean firstRecord = batchBuffer.isEmpty();
         batchBuffer.add(new PendingRecord(params, kind, invokeNanos, eventTimeMs));
+        if (firstRecord) {
+            firstBufferedAtMs = currentProcessingTime();
+            firstBufferedAtNanos = batchBuffer.get(0).bufferedAtNanos;
+            registerFlushTimer();
+        }
         if (latencyMetrics != null) {
             latencyMetrics.setBuffered(batchBuffer.size());
         }
@@ -259,9 +306,38 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         // Flush if batch is full or interval has elapsed
         if (batchBuffer.size() >= batchSize) {
             flushBuffer();
-        } else if (batchFlushIntervalMs > 0
-                && (System.currentTimeMillis() - lastFlushTimeMs) >= batchFlushIntervalMs) {
+        } else if (processingTimeService == null && batchFlushIntervalMs > 0
+                && (currentProcessingTime() - firstBufferedAtMs) >= batchFlushIntervalMs) {
             flushBuffer();
+        }
+    }
+
+    private long currentProcessingTime() {
+        return processingTimeService == null
+                ? System.currentTimeMillis() : processingTimeService.getCurrentProcessingTime();
+    }
+
+    private void registerFlushTimer() {
+        if (processingTimeService == null || batchFlushIntervalMs == 0 || batchSize == 1) {
+            return;
+        }
+        final long generation = ++timerGeneration;
+        // Flink's WriterInitContext service already dispatches callbacks through the mailbox.
+        flushTimer = processingTimeService.registerTimer(firstBufferedAtMs + batchFlushIntervalMs,
+                ignored -> {
+                    if (closed || generation != timerGeneration || batchBuffer.isEmpty()) {
+                        return;
+                    }
+                    checkAsyncError();
+                    flushBuffer();
+                });
+    }
+
+    private void invalidateFlushTimer() {
+        ++timerGeneration;
+        if (flushTimer != null) {
+            flushTimer.cancel(false);
+            flushTimer = null;
         }
     }
 
@@ -277,6 +353,11 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
     @Override
     public void close() throws Exception {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        invalidateFlushTimer();
         // Flush remaining records before closing
         try {
             flushBuffer();
@@ -300,8 +381,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         // Guard against re-entrancy: yielding to the mailbox below may run mail that triggers
         // another flush; we must not iterate/clear the buffer concurrently.
         flushing = true;
+        invalidateFlushTimer();
         try {
             int remaining = batchBuffer.size();
+            int submitted = 0;
             for (PendingRecord record : batchBuffer) {
                 // Rate limiting: throttle the rate at which commands are issued to Redis (write
                 // QPS). Wait cooperatively so the task/mailbox thread stays responsive to
@@ -314,14 +397,16 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                 // slow Redis does not freeze the task thread for the whole timeout.
                 acquireInFlightPermit();
 
-                // Check for async errors before sending more
-                checkAsyncError();
                 if (latencyMetrics != null) {
                     latencyMetrics.setBuffered(--remaining);
                 }
 
                 try {
+                    checkAsyncError();
                     sendRecord(record);
+                    submitted++;
+                    firstBufferedAtNanos = submitted < batchBuffer.size()
+                            ? batchBuffer.get(submitted).bufferedAtNanos : 0L;
                     if (numRecordsSendCounter != null) {
                         numRecordsSendCounter.inc();
                     }
@@ -347,7 +432,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             if (latencyMetrics != null) {
                 latencyMetrics.setBuffered(0);
             }
-            lastFlushTimeMs = System.currentTimeMillis();
+            firstBufferedAtNanos = 0L;
         } finally {
             flushing = false;
         }
@@ -403,12 +488,8 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         if (mailboxExecutor == null) {
             return false;
         }
-        try {
-            return mailboxExecutor.tryYield();
-        } catch (Throwable t) {
-            // Mailbox may be closing; fall back to plain waiting.
-            return false;
-        }
+        // Mail failures must propagate; swallowing them can hide timer or async write failures.
+        return mailboxExecutor.tryYield();
     }
 
     /**
@@ -442,12 +523,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                     redisFuture.whenComplete((r, t) -> {
                         // Release the backpressure permit
                         inFlightSemaphore.release();
-                        // Set TTL
-                        setTtl(record.params[0]);
                         // Track async errors
                         if (t != null) {
                             LOG.error("Async Redis write failed for key: {}", record.params[0], (Throwable) t);
-                            asyncError.compareAndSet(null, (Throwable) t);
+                            recordAsyncFailure((Throwable) t);
                             if (numRecordsSendErrorsCounter != null) {
                                 numRecordsSendErrorsCounter.inc();
                             }
@@ -455,6 +534,11 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                         // Remove from tracked futures
                         synchronized (inFlightFutures) {
                             inFlightFutures.remove(trackedFuture);
+                        }
+                        try {
+                            setTtl(record.params[0]);
+                        } catch (Exception e) {
+                            recordAsyncFailure(e);
                         }
                     });
                     if (latencyMetrics != null) {
@@ -467,12 +551,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
                 break;
             } catch (UnsupportedOperationException e) {
-                inFlightSemaphore.release();
                 throw e;
             } catch (Exception e1) {
                 LOG.error("sink redis error, retry times:{}", i, e1);
                 if (i >= this.maxRetryTimes) {
-                    inFlightSemaphore.release();
                     throw new RuntimeException("sink redis error ", e1);
                 }
                 Thread.sleep(500L * i);
@@ -499,12 +581,21 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         }
     }
 
-    /**
-     * Checks if any async operation has failed and throws an IOException if so.
-     * This propagates async errors back to Flink's processing pipeline.
-     */
+    /** Notifies even an idle task of the first asynchronous failure. */
+    private void recordAsyncFailure(Throwable error) {
+        if (asyncError.compareAndSet(null, error) && mailboxExecutor != null && !closed) {
+            try {
+                mailboxExecutor.execute(this::checkAsyncError, "Redis async write failure");
+            } catch (RejectedExecutionException e) {
+                // A closing mailbox cannot accept mail. Retain the failure for flush/write.
+                LOG.debug("Mailbox rejected Redis failure notification during shutdown", e);
+            }
+        }
+    }
+
+    /** Retains the failure so subsequent flushes cannot mistakenly report success. */
     private void checkAsyncError() throws IOException {
-        Throwable error = asyncError.getAndSet(null);
+        Throwable error = asyncError.get();
         if (error != null) {
             throw new IOException("Async Redis write failed", error);
         }
