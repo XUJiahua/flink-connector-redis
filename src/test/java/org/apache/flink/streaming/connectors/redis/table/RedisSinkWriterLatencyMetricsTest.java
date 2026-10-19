@@ -18,6 +18,8 @@
 
 package org.apache.flink.streaming.connectors.redis.table;
 
+import org.apache.flink.api.common.operators.MailboxExecutor;
+import org.apache.flink.api.common.operators.ProcessingTimeService;
 import org.apache.flink.api.connector.sink2.SinkWriter;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.metrics.SimpleCounter;
@@ -36,6 +38,7 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.DataType;
+import org.apache.flink.util.function.ThrowingRunnable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -198,6 +201,18 @@ public class RedisSinkWriterLatencyMetricsTest {
     private RedisSinkWriter createWriter(
             Configuration config, SinkWriterMetricGroup metricGroup, FakeContainer container)
             throws Exception {
+        return createWriter(config, metricGroup, container, null);
+    }
+
+    private RedisSinkWriter createWriter(
+            Configuration config, SinkWriterMetricGroup metricGroup, FakeContainer container,
+            ProcessingTimeService timeService) throws Exception {
+        return createWriter(config, metricGroup, container, timeService, null);
+    }
+
+    private RedisSinkWriter createWriter(
+            Configuration config, SinkWriterMetricGroup metricGroup, FakeContainer container,
+            ProcessingTimeService timeService, MailboxExecutor mailbox) throws Exception {
         FlinkSingleConfig flinkConfig =
                 new FlinkSingleConfig.Builder()
                         .setHost("127.0.0.1")
@@ -212,13 +227,183 @@ public class RedisSinkWriterLatencyMetricsTest {
                 Arrays.asList(DataTypes.STRING(), DataTypes.STRING(), DataTypes.STRING());
         RedisSinkWriter writer =
                 new RedisSinkWriter(
-                        flinkConfig, mapper, columnDataTypes, config, metricGroup, 1, null);
+                        flinkConfig, mapper, columnDataTypes, config, metricGroup, 1, mailbox, timeService);
         Field field = RedisSinkWriter.class.getDeclaredField("redisCommandsContainer");
         field.setAccessible(true);
         RedisCommandsContainer original = (RedisCommandsContainer) field.get(writer);
         field.set(writer, container.proxy());
         original.close();
         return writer;
+    }
+
+    private static final class ManualTime implements ProcessingTimeService {
+
+        long now;
+        final java.util.TreeMap<Long, java.util.List<ProcessingTimeCallback>> timers =
+                new java.util.TreeMap<>();
+
+        @Override
+        public long getCurrentProcessingTime() {
+            return now;
+        }
+
+        @Override
+        public java.util.concurrent.ScheduledFuture<?> registerTimer(
+                long timestamp, ProcessingTimeCallback callback) {
+            timers.computeIfAbsent(timestamp, ignored -> new ArrayList<>()).add(callback);
+            // Deliberately deliver cancelled callbacks too, simulating already queued timer mail.
+            return null;
+        }
+
+        void advance(long timestamp) throws Exception {
+            now = timestamp;
+            while (!timers.isEmpty() && timers.firstKey() <= now) {
+                java.util.Map.Entry<Long, java.util.List<ProcessingTimeCallback>> entry =
+                        timers.pollFirstEntry();
+                for (ProcessingTimeCallback callback : entry.getValue()) {
+                    callback.onProcessingTime(entry.getKey());
+                }
+            }
+        }
+    }
+
+    @Test
+    void singleRecordFlushesWithoutMoreInputOrCheckpoint() throws Exception {
+        ManualTime time = new ManualTime();
+        fake.autoComplete.set(true);
+        RedisSinkWriter writer = createWriter(config(100, 10, 0), null, fake, time);
+        try {
+            writer.write(row("k", "f", "v"), new Ctx());
+            time.advance(999);
+            assertTrue(fake.calls.isEmpty());
+            time.advance(1000);
+            assertEquals(Collections.singletonList("hset[k, f, v]"), fake.calls);
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void laterRecordsDoNotPostponeFirstRecordDeadline() throws Exception {
+        ManualTime time = new ManualTime();
+        fake.autoComplete.set(true);
+        RedisSinkWriter writer = createWriter(config(100, 10, 0), null, fake, time);
+        try {
+            writer.write(row("k1", "f", "v"), new Ctx());
+            time.advance(900);
+            writer.write(row("k2", "f", "v"), new Ctx());
+            time.advance(1000);
+            assertEquals(2, fake.hsetCalls.get());
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void staleTimerAfterSizeFlushCannotFlushNextBatch() throws Exception {
+        ManualTime time = new ManualTime();
+        fake.autoComplete.set(true);
+        RedisSinkWriter writer = createWriter(config(2, 10, 0), null, fake, time);
+        try {
+            writer.write(row("k1", "f", "v"), new Ctx());
+            time.advance(100);
+            writer.write(row("k2", "f", "v"), new Ctx());
+            assertEquals(2, fake.hsetCalls.get());
+            time.advance(500);
+            writer.write(row("k3", "f", "v"), new Ctx());
+            time.advance(1000);
+            assertEquals(2, fake.hsetCalls.get());
+            time.advance(1500);
+            assertEquals(3, fake.hsetCalls.get());
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void checkpointAndCloseInvalidateTimers() throws Exception {
+        ManualTime time = new ManualTime();
+        fake.autoComplete.set(true);
+        RedisSinkWriter writer = createWriter(config(100, 10, 0), null, fake, time);
+        try {
+            writer.write(row("k1", "f", "v"), new Ctx());
+            writer.flush(false);
+            time.advance(500);
+            writer.write(row("k2", "f", "v"), new Ctx());
+            time.advance(1000);
+            assertEquals(1, fake.hsetCalls.get());
+            writer.close();
+            time.advance(2000);
+            assertEquals(2, fake.hsetCalls.get());
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void zeroIntervalDisablesTimers() throws Exception {
+        ManualTime time = new ManualTime();
+        fake.autoComplete.set(true);
+        Configuration config = config(100, 10, 0);
+        config.set(RedisOptions.SINK_BATCH_FLUSH_INTERVAL, 0L);
+        RedisSinkWriter writer = createWriter(config, null, fake, time);
+        try {
+            writer.write(row("k", "f", "v"), new Ctx());
+            time.advance(10000);
+            assertTrue(fake.calls.isEmpty());
+            assertTrue(time.timers.isEmpty());
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void timedAsyncFailureNotifiesMailboxWithoutAnotherWrite() throws Exception {
+        ManualTime time = new ManualTime();
+        List<ThrowingRunnable<Exception>> mail = new ArrayList<>();
+        MailboxExecutor mailbox = (MailboxExecutor) Proxy.newProxyInstance(
+                MailboxExecutor.class.getClassLoader(), new Class<?>[]{MailboxExecutor.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("execute")) {
+                        for (Object arg : args) {
+                            if (arg instanceof ThrowingRunnable) {
+                                mail.add((ThrowingRunnable<Exception>) arg);
+                                return null;
+                            }
+                        }
+                    }
+                    throw new UnsupportedOperationException(method.toString());
+                });
+        RedisSinkWriter writer = createWriter(config(100, 10, 0), null, fake, time, mailbox);
+        try {
+            writer.write(row("k", "f", "v"), new Ctx());
+            time.advance(1000);
+            assertEquals(1, fake.hsetCalls.get());
+            fake.hsetFutures.get(0).completeExceptionally(new RedisException("timer write failed"));
+            assertEquals(1, mail.size());
+            IOException failure = assertThrows(IOException.class, () -> mail.get(0).run());
+            assertEquals("Async Redis write failed", failure.getMessage());
+        } finally {
+            writer.close();
+        }
+    }
+
+    @Test
+    void oldestBufferAgeIsVisibleBeforeFlushAndResetsAfterSubmit() throws Exception {
+        ManualTime time = new ManualTime();
+        fake.autoComplete.set(true);
+        RedisSinkWriter writer = createWriter(config(100, 10, 0), metricGroup(), fake, time);
+        try {
+            assertEquals(0L, (long) capture.<Long>gaugeValue("redis_sink_oldest_buffer_age_ms"));
+            writer.write(row("k", "f", "v"), new Ctx());
+            Thread.sleep(20);
+            assertTrue(capture.<Long>gaugeValue("redis_sink_oldest_buffer_age_ms") >= 10L);
+            assertTrue(fake.calls.isEmpty());
+            time.advance(1000);
+            assertEquals(0L, (long) capture.<Long>gaugeValue("redis_sink_oldest_buffer_age_ms"));
+        } finally {
+            writer.close();
+        }
     }
 
     private static RowData row(String key, String field, String value) {
@@ -275,6 +460,7 @@ public class RedisSinkWriterLatencyMetricsTest {
             expected.add(BUFFER_SIZE);
             expected.add(PENDING);
             expected.add(SOURCE);
+            expected.add("redis_sink_oldest_buffer_age_ms");
             assertEquals(expected, capture.metrics().keySet());
         } finally {
             writer.close();
@@ -481,7 +667,7 @@ public class RedisSinkWriterLatencyMetricsTest {
         FakeContainer withoutMetrics = new FakeContainer();
         Throwable failureWithout = runScript(withoutMetrics, null);
 
-        assertEquals(15, registered);
+        assertEquals(16, registered);
         // the metricGroup == null run registered nothing
         assertEquals(registered, capture.metrics().size());
         assertEquals(

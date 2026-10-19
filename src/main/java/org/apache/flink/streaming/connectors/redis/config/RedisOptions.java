@@ -225,8 +225,8 @@ public class RedisOptions {
                     .longType()
                     .defaultValue(1000L)
                     .withDescription(
-                            "The maximum time in milliseconds to buffer records before flushing, "
-                                    + "even if batch size has not been reached.");
+                            "Processing-time interval in milliseconds from the first buffered record. "
+                                    + "Flushes even without further input; 0 disables timed flushing.");
 
     public static final ConfigOption<Long> SINK_WRITE_QPS =
             ConfigOptions.key("sink.write.qps")

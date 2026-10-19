@@ -61,10 +61,12 @@ public class RedisSink implements Sink<RowData> {
         if (limited) {
             return new RedisLimitedSinkWriter(
                     flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
-                    context.metricGroup(), numParallelSubtasks, context.getMailboxExecutor());
+                    context.metricGroup(), numParallelSubtasks, context.getMailboxExecutor(),
+                    context.getProcessingTimeService());
         }
         return new RedisSinkWriter(
                 flinkConfigBase, redisSinkMapper, columnDataTypes, readableConfig,
-                context.metricGroup(), numParallelSubtasks, context.getMailboxExecutor());
+                context.metricGroup(), numParallelSubtasks, context.getMailboxExecutor(),
+                context.getProcessingTimeService());
     }
 }

@@ -19,6 +19,7 @@
 package org.apache.flink.streaming.connectors.redis.table;
 
 import org.apache.flink.api.common.operators.MailboxExecutor;
+import org.apache.flink.api.common.operators.ProcessingTimeService;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.metrics.groups.SinkWriterMetricGroup;
 import org.apache.flink.streaming.connectors.redis.config.FlinkConfigBase;
@@ -46,6 +47,8 @@ public class RedisLimitedSinkWriter extends RedisSinkWriter {
     private final int maxNum;
     private volatile int curNum;
 
+    /** Legacy constructor; use the overload with a Flink processing-time service. */
+    @Deprecated
     public RedisLimitedSinkWriter(
             FlinkConfigBase flinkConfigBase,
             RedisSinkMapper<RowData> redisSinkMapper,
@@ -54,8 +57,21 @@ public class RedisLimitedSinkWriter extends RedisSinkWriter {
             SinkWriterMetricGroup metricGroup,
             int numParallelSubtasks,
             MailboxExecutor mailboxExecutor) {
+        this(flinkConfigBase, redisSinkMapper, columnDataTypes, config, metricGroup,
+                numParallelSubtasks, mailboxExecutor, null);
+    }
+
+    public RedisLimitedSinkWriter(
+            FlinkConfigBase flinkConfigBase,
+            RedisSinkMapper<RowData> redisSinkMapper,
+            List<DataType> columnDataTypes,
+            ReadableConfig config,
+            SinkWriterMetricGroup metricGroup,
+            int numParallelSubtasks,
+            MailboxExecutor mailboxExecutor,
+            ProcessingTimeService processingTimeService) {
         super(flinkConfigBase, redisSinkMapper, columnDataTypes, config, metricGroup,
-                numParallelSubtasks, mailboxExecutor);
+                numParallelSubtasks, mailboxExecutor, processingTimeService);
 
         this.maxOnline = config.get(RedisOptions.SINK_LIMIT_MAX_ONLINE);
         Preconditions.checkState(
