@@ -59,8 +59,24 @@ jobs:
         run: |
           mvn clean verify -Dgpg.skip=true
 
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          test "$GITHUB_REF_NAME" = "v$version"
+          test -f "docs/releases/$GITHUB_REF_NAME.md"
+          mkdir -p target/release
+          cp "target/flink-connector-redis-$version.jar" target/release/
+          cp "target/flink-connector-redis-$version-jar-with-dependencies.jar" target/release/
+          cd target/release
+          sha256sum *.jar > SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          files: target/*-jar-with-dependencies.jar
+          body_path: docs/releases/${{ github.ref_name }}.md
+          make_latest: "false"
+          fail_on_unmatched_files: true
+          files: |
+            target/release/*.jar
+            target/release/SHA256SUMS
