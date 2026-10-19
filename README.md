@@ -192,6 +192,76 @@ create table sink_redis(name VARCHAR, subject VARCHAR, score VARCHAR)  with ('co
 | sentinels.info     | (none) | String | 如：10.11.80.147:7000,10.11.80.147:7001,10.11.80.147:8000 |
 | sentinels.password | (none) | String | sentinel进程密码                                            |
 
+## 3.6 Sink 分段延迟指标
+
+Sink V2 writer（SQL 路径）会把一条记录的端到端延迟拆成三段，并给出两个积压 gauge，用于定位“写到 Redis 慢”到底慢在哪一层。只读观测，不改变任何写入逻辑，不需要任何 WITH 选项。指标直接注册在 sink 的 operator metric group 上，代码中的注册名不带 `flink_` 前缀；Prometheus reporter 导出时会加上 `flink_taskmanager_job_task_operator_` 前缀。
+
+| 代码内注册名 | Prometheus 导出名 | 类型 | 含义 |
+|---|---|---|---|
+| `redis_sink_invoke_delay_ms` / `_max_ms` / `_last_ms` | `flink_taskmanager_job_task_operator_redis_sink_invoke_delay_ms{quantile=...}`、`..._ms_count`、`..._max_ms`、`..._last_ms` | summary + gauge | 进入 `write()` 的时刻 − 窗口时间基准（Kafka → Flink → 计算，含等 watermark） |
+| `redis_sink_buffer_wait_ms` / `_max_ms` / `_last_ms` | `flink_taskmanager_job_task_operator_redis_sink_buffer_wait_ms...` | summary + gauge | 首次把命令提交给 Lettuce 的时刻 − 进入 `write()` 的时刻（sink 内部等待） |
+| `redis_sink_cmd_latency_ms` / `_max_ms` / `_last_ms` | `flink_taskmanager_job_task_operator_redis_sink_cmd_latency_ms...` | summary + gauge | 主写命令（如 HSET）ack 时刻 − 提交时刻（网络 + Redis），TTL 的 EXPIRE 不计入 |
+| `redis_sink_ack_freshness_ms` / `_max_ms` / `_last_ms` | `flink_taskmanager_job_task_operator_redis_sink_ack_freshness_ms...` | summary + gauge | 主写命令 ack 时刻 − 窗口时间基准（端到端，约等于上面三段之和） |
+| `redis_sink_buffer_size` | `flink_taskmanager_job_task_operator_redis_sink_buffer_size` | gauge | 缓冲区中还没提交给 Lettuce 的记录数 |
+| `redis_sink_pending_commands` | `flink_taskmanager_job_task_operator_redis_sink_pending_commands` | gauge | 已提交、尚未完成的主写命令数 |
+| `redis_sink_event_time_source` | `flink_taskmanager_job_task_operator_redis_sink_event_time_source` | gauge | 最近一条记录的窗口时间基准口径：0 = 无基准（跳过），1 = record timestamp（精确），2 = watermark 回退（上界） |
+
+每个延迟指标有三种形态：
+- `<x>_ms`：histogram（最近 1024 个样本），导出为 summary 的 quantile 和 `_count`。低流量时分位数会长期停在旧样本上。
+- `<x>_max_ms`：最近 60 秒滑动窗口内的最大值，读取不清零，窗口内没有样本时为 0，可以跨 subtask 用 `max by` 聚合。
+- `<x>_last_ms`：最近一个样本的值。
+
+单位都是毫秒，负值钳成 0，亚毫秒的 Redis 往返显示为 0。label 与现有 `numRecordsSend` 相同（operator scope 变量），不新增任何 label。
+
+> `invoke_delay_ms` 与 `ack_freshness_ms` 的“窗口时间”优先取记录自带的时间戳（`event_time_source=1`，精确）。拿不到时（例如 OVER 之后接了 WHERE/投影的 SQL，这是最常见的情况）退回 `当前 watermark + 1`（`event_time_source=2`），此时这两个值是**上界**：偏大量小于一次 watermark 跳变。低流量时 watermark 一次可能跳十几秒，所以这两个值可能被放大十几秒。判断慢在哪一段时，请以 `buffer_wait_ms` 和 `cmd_latency_ms` 为准，它们是精确值。`event_time_source=0` 表示没有可用基准，这两个指标不产生样本（`_count` 不增长）。
+
+> `buffer_wait_ms` 是“进入 sink 到命令真正发给 Redis”的全部等待，包括：等 flush 触发（下一条记录 / batch 满 / checkpoint）、`sink.write.qps` 限速、等在途许可（`sink.max-in-flight-requests`）。所以 `buffer_wait_ms` 高时要看 `pending_commands`：接近 `sink.max-in-flight-requests`，说明 Redis/网络回不过来，根因在 Redis 一侧；远低于上限，才是记录在 sink 缓冲里等 flush。
+
+窗口时间与 TM 的 `System.currentTimeMillis()` 相减，前提是 rowtime（如 `TIMESTAMP(3)` 的 `creationTime`）按 UTC 墙钟写入；生产方与 TM 的时钟偏差也会叠加进 `invoke_delay`/`ack_freshness`。
+
+推荐 PromQL（`dc` 换成 Prometheus 侧实际区分 A/B 的 label，没有就去掉 `by (dc)`）：
+
+```promql
+# 端到端：每个 DC 中最差 subtask 的 p50，以及 60s 内的最大值
+max by (dc) (flink_taskmanager_job_task_operator_redis_sink_ack_freshness_ms{job_name="$job", quantile="0.5"})
+max by (dc) (flink_taskmanager_job_task_operator_redis_sink_ack_freshness_max_ms{job_name="$job"})
+
+# 三段拆分（同一面板放三条线；按算子拆开时改成 by (dc, operator_name)）
+max by (dc) (flink_taskmanager_job_task_operator_redis_sink_invoke_delay_max_ms{job_name="$job"})
+max by (dc) (flink_taskmanager_job_task_operator_redis_sink_buffer_wait_max_ms{job_name="$job"})
+max by (dc) (flink_taskmanager_job_task_operator_redis_sink_cmd_latency_max_ms{job_name="$job"})
+# p50 版本：把 _max_ms 换成 _ms{quantile="0.5"}
+
+# 积压在哪一层
+max by (dc, operator_name) (flink_taskmanager_job_task_operator_redis_sink_buffer_size{job_name="$job"})
+max by (dc, operator_name) (flink_taskmanager_job_task_operator_redis_sink_pending_commands{job_name="$job"})
+sum by (dc) (flink_taskmanager_job_task_operator_redis_sink_pending_commands{job_name="$job"})
+
+# 在途许可是否耗尽（单 subtask；1000 为 sink.max-in-flight-requests 默认值）
+max by (dc, operator_name) (flink_taskmanager_job_task_operator_redis_sink_pending_commands{job_name="$job"}) >= 0.9 * 1000
+
+# 口径识别：2 = watermark 回退（上界），1 = 精确，0 = 无基准
+max by (dc, operator_name) (flink_taskmanager_job_task_operator_redis_sink_event_time_source{job_name="$job"})
+
+# 样本是否还在产生；基准缺失时 invoke_delay 的速率为 0 而 buffer_wait 的速率 > 0
+sum by (dc) (rate(flink_taskmanager_job_task_operator_redis_sink_ack_freshness_ms_count{job_name="$job"}[1m]))
+sum by (dc, operator_name) (rate(flink_taskmanager_job_task_operator_redis_sink_invoke_delay_ms_count{job_name="$job"}[5m]))
+sum by (dc, operator_name) (rate(flink_taskmanager_job_task_operator_redis_sink_buffer_wait_ms_count{job_name="$job"}[5m]))
+```
+
+解读方法（按顺序判断）：
+1. 先看 `event_time_source`：等于 2 时，`invoke_delay`/`ack_freshness` 是上界，可能被低流量下的 watermark 跳变放大到十几秒；等于 0 时这两个指标没有样本，只能用后两段判断。
+2. `invoke_delay` 高，后两段低：慢在 Kafka → Flink → 计算（含等水位线），或者是回退基准的高估，都不在 sink 里。
+3. `buffer_wait` 高，且同一 subtask 的 `pending_commands` 接近 `sink.max-in-flight-requests`（≥ 0.9×上限）：在途许可耗尽，根因在网络/Redis（此时 `cmd_latency` 通常也高；若 `cmd_latency` 无样本而 `pending` 不降，就是命令卡住）。
+4. `buffer_wait` 高，且 `pending_commands` 远低于上限、`buffer_size>0`：记录在 sink 缓冲里等 flush 触发（低流量算子要等下一条记录或 checkpoint）。
+5. `cmd_latency` 高，或 `pending_commands` 持续 >0 且不下降：慢在网络或 Redis。
+
+注意：summary 的 quantile 跨 subtask 做 `max by` 得到的是“最差 subtask 的 p50”，不是全局 p50；跨 subtask 聚合请看 `_max_ms`。`pending_commands` 判据要按单个 subtask 看（每个 writer 一个许可池）。
+
+序列数：每个 writer 39 个（4 个 summary × 7 + 4 × 2 个 gauge + 3 个 gauge）。例如 13 个 sink 算子 × 并行度 4 = 52 个 writer，约 2,028 个序列。
+
+另外：`set.if.absent=true` 时测到的是 EXISTS/HEXISTS 的往返；ZADD 配 `zset.zremrangeby` 时只测 ZADD；旧版 `RedisSinkFunction`（DataStream）不带这些指标。
+
 # 4 数据类型转换
 
 | flink type   | redis row converter                                          |

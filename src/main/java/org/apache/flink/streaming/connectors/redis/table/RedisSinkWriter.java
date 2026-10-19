@@ -34,6 +34,7 @@ import org.apache.flink.streaming.connectors.redis.container.RedisCommandsContai
 import org.apache.flink.streaming.connectors.redis.container.RedisCommandsContainerBuilder;
 import org.apache.flink.streaming.connectors.redis.converter.RedisRowConverter;
 import org.apache.flink.streaming.connectors.redis.mapper.RedisSinkMapper;
+import org.apache.flink.streaming.connectors.redis.metrics.RedisSinkLatencyMetrics;
 import org.apache.flink.streaming.connectors.redis.util.TokenBucketRateLimiter;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.DataType;
@@ -80,6 +81,8 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
     private transient Counter numRecordsSendCounter;
     private transient Counter numRecordsSendErrorsCounter;
     private transient Counter numBytesSendCounter;
+    // null when metricGroup is null or registration failed
+    private transient RedisSinkLatencyMetrics latencyMetrics;
 
     // --- Batching fields ---
     private final int batchSize;
@@ -114,10 +117,16 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
         final String[] params;
         final RowKind kind;
+        // System.nanoTime() on entry to write(); 0 when latency metrics are off
+        final long invokeNanos;
+        // window-time reference (epoch ms), RedisSinkLatencyMetrics.NO_EVENT_TIME when absent
+        final long eventTimeMs;
 
-        PendingRecord(String[] params, RowKind kind) {
+        PendingRecord(String[] params, RowKind kind, long invokeNanos, long eventTimeMs) {
             this.params = params;
             this.kind = kind;
+            this.invokeNanos = invokeNanos;
+            this.eventTimeMs = eventTimeMs;
         }
     }
 
@@ -169,6 +178,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             this.numRecordsSendCounter = metricGroup.getNumRecordsSendCounter();
             this.numRecordsSendErrorsCounter = metricGroup.getNumRecordsSendErrorsCounter();
             this.numBytesSendCounter = metricGroup.getNumBytesSendCounter();
+            this.latencyMetrics = RedisSinkLatencyMetrics.tryRegister(metricGroup);
         }
 
         // Initialize Redis connection
@@ -218,6 +228,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         if (kind == RowKind.UPDATE_BEFORE) {
             return;
         }
+        long invokeNanos = 0L;
+        long eventTimeMs = RedisSinkLatencyMetrics.NO_EVENT_TIME;
+        if (latencyMetrics != null) {
+            invokeNanos = latencyMetrics.nanoTime();
+            eventTimeMs = latencyMetrics.resolveEventTime(context);
+            latencyMetrics.onInvoke(eventTimeMs);
+        }
         String[] params = new String[calcParamNumByCommand(rowData.getArity())];
         for (int i = 0; i < params.length; i++) {
             params[i] =
@@ -234,7 +251,10 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         }
 
         // Buffer the record
-        batchBuffer.add(new PendingRecord(params, kind));
+        batchBuffer.add(new PendingRecord(params, kind, invokeNanos, eventTimeMs));
+        if (latencyMetrics != null) {
+            latencyMetrics.setBuffered(batchBuffer.size());
+        }
 
         // Flush if batch is full or interval has elapsed
         if (batchBuffer.size() >= batchSize) {
@@ -281,6 +301,7 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         // another flush; we must not iterate/clear the buffer concurrently.
         flushing = true;
         try {
+            int remaining = batchBuffer.size();
             for (PendingRecord record : batchBuffer) {
                 // Rate limiting: throttle the rate at which commands are issued to Redis (write
                 // QPS). Wait cooperatively so the task/mailbox thread stays responsive to
@@ -295,6 +316,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
 
                 // Check for async errors before sending more
                 checkAsyncError();
+                if (latencyMetrics != null) {
+                    latencyMetrics.setBuffered(--remaining);
+                }
 
                 try {
                     sendRecord(record);
@@ -320,6 +344,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
             }
 
             batchBuffer.clear();
+            if (latencyMetrics != null) {
+                latencyMetrics.setBuffered(0);
+            }
             lastFlushTimeMs = System.currentTimeMillis();
         } finally {
             flushing = false;
@@ -391,6 +418,13 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
         for (int i = 0; i <= maxRetryTimes; i++) {
             try {
                 RedisFuture redisFuture = null;
+                long submitNanos = 0L;
+                if (latencyMetrics != null) {
+                    submitNanos = latencyMetrics.nanoTime();
+                    if (i == 0) {
+                        latencyMetrics.onFirstSubmit(record.invokeNanos, submitNanos);
+                    }
+                }
                 if (record.kind == RowKind.DELETE) {
                     redisFuture = rowKindDelete(record.params);
                 } else {
@@ -423,6 +457,9 @@ public class RedisSinkWriter implements SinkWriter<RowData> {
                             inFlightFutures.remove(trackedFuture);
                         }
                     });
+                    if (latencyMetrics != null) {
+                        latencyMetrics.onSubmitted(redisFuture, submitNanos, record.eventTimeMs);
+                    }
                 } else {
                     // No future returned, release permit immediately
                     inFlightSemaphore.release();

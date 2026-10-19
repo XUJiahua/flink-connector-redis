@@ -142,6 +142,26 @@ key: name, field:subject, value: name\01subject\01score.
 | sentinels.info     | (none)  | String |             |
 | sentinels.password | none)   | String |             |
 
+##### Sink latency metrics
+
+The Sink V2 writer (SQL path) splits the end-to-end latency of a record into three segments and exposes two backlog gauges. They are observation only; write behavior is unchanged and no WITH option is needed. Registered names carry no `flink_` prefix; the Prometheus reporter exports them as `flink_taskmanager_job_task_operator_<name>`.
+
+| Registered name | Type | Meaning |
+|---|---|---|
+| `redis_sink_invoke_delay_ms` / `_max_ms` / `_last_ms` | histogram + gauges | entering `write()` − window-time reference (Kafka → Flink → compute) |
+| `redis_sink_buffer_wait_ms` / `_max_ms` / `_last_ms` | histogram + gauges | first submit to Lettuce − entering `write()` (inside the sink) |
+| `redis_sink_cmd_latency_ms` / `_max_ms` / `_last_ms` | histogram + gauges | ack of the main write command (e.g. HSET, not the TTL EXPIRE) − submit (network + Redis) |
+| `redis_sink_ack_freshness_ms` / `_max_ms` / `_last_ms` | histogram + gauges | ack − window-time reference (end to end) |
+| `redis_sink_buffer_size` | gauge | records buffered and not yet submitted |
+| `redis_sink_pending_commands` | gauge | main write commands submitted and not yet completed |
+| `redis_sink_event_time_source` | gauge | reference used by the latest record: 0 = none (skipped), 1 = record timestamp (exact), 2 = watermark fallback (upper bound) |
+
+`<x>_ms` is a histogram over the last 1024 samples (exported as summary quantiles and `_count`), `<x>_max_ms` is the max over a 60s sliding window (0 when empty, not reset on read), `<x>_last_ms` is the latest sample. Values are milliseconds, negatives are clamped to 0.
+
+Caveats:
+- `invoke_delay` and `ack_freshness` use the record timestamp when present. Otherwise (e.g. a WHERE/projection after an OVER aggregate, the common case) they fall back to `currentWatermark + 1` and become an **upper bound**: they overestimate by less than one watermark jump, which can be more than ten seconds at low traffic. Use the exact `buffer_wait` and `cmd_latency` to decide where the time goes. With `event_time_source=0` these two metrics produce no samples.
+- `buffer_wait` includes waiting for a flush trigger, `sink.write.qps` throttling and waiting for an in-flight permit (`sink.max-in-flight-requests`). Read it together with `pending_commands`: close to the in-flight limit means Redis/network cannot keep up; far below it means records are waiting in the sink buffer for a flush.
+
 ### Data Type Converter
 
 | flink type | redis row converter                                          |
